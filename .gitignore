@@ -1,0 +1,22 @@
+# Secrets — never commit these.
+.env
+.env.local
+token.json
+*.pem
+*.key
+
+# Go build artifacts.
+/bin/
+/dist/
+/out/
+*.exe
+*.test
+*.out
+vendor/
+
+# Editors / OS.
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,26 @@
+services:
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/arm64
+    image: volvo-charge-monitor:latest
+    container_name: volvo-charge-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - token-data:/data
+    ports:
+      - "8080:8080"
+    # Rely on `restart: unless-stopped` — distroless image has no shell or
+    # curl/wget for a HEALTHCHECK. External monitors can hit /healthz on :8080.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  token-data:
