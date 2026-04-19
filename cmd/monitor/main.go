@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -25,7 +26,14 @@ import (
 	"github.com/tokko/volvo-tibber-sync/internal/volvo"
 )
 
+var (
+	flagOnce    = flag.Bool("once", false, "run one poll cycle and exit (useful for testing or cron)")
+	flagDryRun  = flag.Bool("dry-run", false, "fetch Volvo state and log the intended Tibber push, but do not call Tibber")
+)
+
 func main() {
+	flag.Parse()
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
@@ -97,6 +105,8 @@ func run() error {
 		"http_addr", httpAddr,
 		"token_store", tokenStore,
 		"tibber_enabled", tbrClient != nil,
+		"once", *flagOnce,
+		"dry_run", *flagDryRun,
 	)
 
 	pollOnce := func() {
@@ -107,12 +117,22 @@ func run() error {
 		latest.state = &state
 		latest.Unlock()
 		logState(state)
-		if tbrClient != nil {
-			pushToTibber(pCtx, tbrClient, tbrConf, state)
+		if tbrClient == nil {
+			return
 		}
+		if *flagDryRun {
+			logDryRunPush(tbrConf, state)
+			return
+		}
+		pushToTibber(pCtx, tbrClient, tbrConf, state)
 	}
 
 	pollOnce()
+	if *flagOnce {
+		slog.Info("--once: exiting after single poll")
+		return nil
+	}
+
 	t := time.NewTicker(pollInterval)
 	defer t.Stop()
 	for {
@@ -124,6 +144,20 @@ func run() error {
 			pollOnce()
 		}
 	}
+}
+
+func logDryRunPush(cfg tibberConfig, s volvo.ChargeState) {
+	if s.BatteryChargeLevelPct == nil {
+		slog.Info("tibber push (dry-run skipped — no battery level this poll)",
+			"vehicle", cfg.vehicleName, "vehicle_id", cfg.vehicleID)
+		return
+	}
+	pct := int(*s.BatteryChargeLevelPct + 0.5)
+	slog.Info("tibber push (dry-run — NOT sent)",
+		"vehicle", cfg.vehicleName, "vehicle_id", cfg.vehicleID,
+		"home_id", cfg.homeID, "battery_pct", pct,
+		"mutation", "setVehicleSettings", "key", "offline.vehicle.batteryLevel",
+	)
 }
 
 func logState(s volvo.ChargeState) {
