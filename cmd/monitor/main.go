@@ -1,7 +1,10 @@
-// Command monitor polls the Volvo Energy API on an interval and logs charge state
-// as one JSON object per poll to stdout. It refreshes the OAuth access token
-// automatically; the refresh token is read from env and rotations are persisted
-// to TOKEN_STORE_PATH (default /data/token.json) so restarts don't need re-auth.
+// Command monitor polls the Volvo Energy API on an interval, logs charge state
+// as JSON to stdout, and optionally mirrors the battery percentage into Tibber
+// via the undocumented app API (so Tibber smart charging sees the real SoC).
+//
+// Volvo access token refresh is automatic; rotations persist to
+// TOKEN_STORE_PATH so restarts don't force re-OAuth. Tibber session JWTs are
+// cached the same way.
 package main
 
 import (
@@ -18,6 +21,7 @@ import (
 	"time"
 
 	"github.com/tokko/volvo-tibber-sync/internal/config"
+	"github.com/tokko/volvo-tibber-sync/internal/tibber"
 	"github.com/tokko/volvo-tibber-sync/internal/volvo"
 )
 
@@ -60,6 +64,7 @@ func run() error {
 		return fmt.Errorf("invalid POLL_INTERVAL: %w", err)
 	}
 	tokenStore := config.Optional("TOKEN_STORE_PATH", "/data/token.json")
+	tibberStore := config.Optional("TIBBER_TOKEN_STORE_PATH", "/data/tibber-token.json")
 	httpAddr := config.Optional("HTTP_ADDR", ":8080")
 
 	// Use stored token if present (survives restarts and keeps any rotated refresh
@@ -74,10 +79,12 @@ func run() error {
 
 	ts := volvo.NewTokenSource(clientID, clientSecret, initial, func(t volvo.Token) {
 		if err := saveStoredToken(tokenStore, t); err != nil {
-			slog.Warn("could not persist refreshed token", "path", tokenStore, "err", err)
+			slog.Warn("could not persist refreshed volvo token", "path", tokenStore, "err", err)
 		}
 	})
 	client := volvo.NewClient(ts, apiKey, vin)
+
+	tbrClient, tbrConf := buildTibberClient(tibberStore)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -89,9 +96,9 @@ func run() error {
 		"poll_interval", pollInterval.String(),
 		"http_addr", httpAddr,
 		"token_store", tokenStore,
+		"tibber_enabled", tbrClient != nil,
 	)
 
-	// Poll once immediately, then on interval.
 	pollOnce := func() {
 		pCtx, pCancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer pCancel()
@@ -100,6 +107,9 @@ func run() error {
 		latest.state = &state
 		latest.Unlock()
 		logState(state)
+		if tbrClient != nil {
+			pushToTibber(pCtx, tbrClient, tbrConf, state)
+		}
 	}
 
 	pollOnce()
@@ -187,6 +197,96 @@ func dirOf(path string) string {
 type latestState struct {
 	sync.RWMutex
 	state *volvo.ChargeState
+}
+
+type tibberConfig struct {
+	homeID      string
+	vehicleID   string
+	vehicleName string
+}
+
+// buildTibberClient returns a configured client or (nil, _) if Tibber is not
+// configured. Any partial-but-invalid configuration is logged and treated as
+// disabled so the core Volvo flow isn't held hostage.
+func buildTibberClient(tokenStorePath string) (*tibber.Client, tibberConfig) {
+	email := config.Optional("TIBBER_EMAIL", "")
+	password := config.Optional("TIBBER_PASSWORD", "")
+	homeID := config.Optional("TIBBER_HOME_ID", "")
+	vehicleID := config.Optional("TIBBER_VEHICLE_ID", "")
+	vehicleName := config.Optional("TIBBER_VEHICLE_NAME", "")
+
+	if email == "" && password == "" && homeID == "" && vehicleID == "" {
+		return nil, tibberConfig{}
+	}
+	if email == "" || password == "" || homeID == "" || vehicleID == "" {
+		slog.Warn("tibber partially configured; skipping push — need TIBBER_EMAIL, TIBBER_PASSWORD, TIBBER_HOME_ID, TIBBER_VEHICLE_ID")
+		return nil, tibberConfig{}
+	}
+
+	sess := tibber.NewSession(email, password)
+	if stored, ok := loadTibberToken(tokenStorePath); ok {
+		sess.Seed(stored.Token, stored.ExpiresAt)
+		slog.Info("loaded tibber token from store", "path", tokenStorePath, "expires_at", stored.ExpiresAt)
+	}
+	sess.SetOnRefresh(func(token string, expiresAt time.Time) {
+		if err := saveTibberToken(tokenStorePath, tibberToken{Token: token, ExpiresAt: expiresAt}); err != nil {
+			slog.Warn("could not persist tibber token", "path", tokenStorePath, "err", err)
+		}
+	})
+
+	return tibber.NewClient(sess), tibberConfig{
+		homeID:      homeID,
+		vehicleID:   vehicleID,
+		vehicleName: vehicleName,
+	}
+}
+
+func pushToTibber(ctx context.Context, c *tibber.Client, cfg tibberConfig, s volvo.ChargeState) {
+	if s.BatteryChargeLevelPct == nil {
+		slog.Warn("no battery level from volvo this poll; skipping tibber push")
+		return
+	}
+	pct := int(*s.BatteryChargeLevelPct + 0.5)
+	if err := c.SetBatteryLevel(ctx, cfg.homeID, cfg.vehicleID, pct); err != nil {
+		slog.Error("tibber push failed", "err", err, "vehicle", cfg.vehicleName, "battery_pct", pct)
+		return
+	}
+	slog.Info("tibber push ok", "vehicle", cfg.vehicleName, "vehicle_id", cfg.vehicleID, "battery_pct", pct)
+}
+
+type tibberToken struct {
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+func loadTibberToken(path string) (tibberToken, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return tibberToken{}, false
+	}
+	var t tibberToken
+	if err := json.Unmarshal(b, &t); err != nil {
+		return tibberToken{}, false
+	}
+	if t.Token == "" || time.Now().After(t.ExpiresAt) {
+		return tibberToken{}, false
+	}
+	return t, true
+}
+
+func saveTibberToken(path string, t tibberToken) error {
+	b, err := json.MarshalIndent(t, "", "  ")
+	if err != nil {
+		return err
+	}
+	if dir := dirOf(path); dir != "" {
+		_ = os.MkdirAll(dir, 0o700)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func serveHTTP(ctx context.Context, addr string, latest *latestState) {
