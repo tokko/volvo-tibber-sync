@@ -17,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/andreasmikaelgustafsson/volvo-charge-monitor/internal/config"
-	"github.com/andreasmikaelgustafsson/volvo-charge-monitor/internal/volvo"
+	"github.com/tokko/volvo-tibber-sync/internal/config"
+	"github.com/tokko/volvo-tibber-sync/internal/volvo"
 )
 
 func main() {
