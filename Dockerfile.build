@@ -1,0 +1,51 @@
+# syntax=docker/dockerfile:1.7
+#
+# Dedicated build image.
+#
+# This image exists solely to compile the Go binaries for linux/arm64
+# (Raspberry Pi 5). It is NOT the runtime image — see Dockerfile for that.
+#
+# Two use cases:
+#
+#  1. As the upstream builder for the prod image (docker compose build will
+#     transitively use the same logic inlined into Dockerfile's build stage).
+#
+#  2. As a host-binary extractor when you just want static arm64 binaries on
+#     disk to scp to the Pi — no containers on the Pi itself:
+#
+#        docker buildx build \
+#          -f Dockerfile.build \
+#          --platform linux/arm64 \
+#          --output type=local,dest=./dist .
+#
+#     This writes dist/monitor, dist/oauth, dist/tibber-discover.
+
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+
+WORKDIR /src
+
+# Module cache layer — re-used whenever go.mod is unchanged.
+COPY go.mod ./
+RUN go mod download
+
+COPY . .
+
+ARG TARGETOS=linux
+ARG TARGETARCH=arm64
+
+# Compile all three commands in one RUN layer to share build cache.
+# CGO disabled → fully static; -s -w strips symbols and DWARF; -trimpath
+# removes local paths from the binary.
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /out/monitor         ./cmd/monitor && \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /out/oauth           ./cmd/oauth && \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /out/tibber-discover ./cmd/tibber-discover
+
+# Export stage — scratch + the binaries only. Used by `--output type=local`
+# to drop the compiled bits onto the host filesystem.
+FROM scratch AS export
+COPY --from=build /out/monitor         /monitor
+COPY --from=build /out/oauth           /oauth
+COPY --from=build /out/tibber-discover /tibber-discover
