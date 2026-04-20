@@ -15,13 +15,53 @@ rest of the time the process sleeps.
 
 ### Volvo Cars Developer Portal
 
-1. Sign in at [developer.volvocars.com](https://developer.volvocars.com).
-2. Create an application and subscribe it to the **Volvo Energy API**.
-3. Add `http://localhost:8090/callback` as an allowed redirect URI (needed for
-   the one-time OAuth step).
-4. Note your **Client ID**, **Client Secret**, and **VCC-API-Key**.
-5. Find your car's **VIN** (visible in the Volvo Cars app under vehicle details,
-   or on the dashboard).
+You need a free developer account to get API access. This is a one-time setup
+that takes about 10 minutes.
+
+#### 1 — Create an account
+
+Go to [developer.volvocars.com](https://developer.volvocars.com) and sign in
+with your regular Volvo ID (the same account you use in the Volvo Cars app).
+If you don't have a Volvo ID, create one at
+[volvocars.com](https://www.volvocars.com).
+
+#### 2 — Create an application
+
+1. Click **Applications** in the top navigation, then **Create application**.
+2. Fill in a name (e.g. `home-charging-sync`) and a short description.
+3. Under **APIs**, tick **Volvo Energy API**. This is the only API needed.
+4. Submit. You'll be taken to the application detail page.
+
+From the application detail page, copy:
+- **Client ID** → `VOLVO_CLIENT_ID`
+- **Client Secret** → `VOLVO_CLIENT_SECRET` (shown once — save it now)
+
+#### 3 — Get the VCC-API-Key
+
+1. On the application detail page, click **View subscriptions** (or navigate to
+   the **Subscriptions** tab).
+2. You should see one subscription for the **Volvo Energy API**.
+3. Click **Show keys** next to it. Copy the **Primary Key**.
+
+That Primary Key is your `VOLVO_API_KEY`.
+
+#### 4 — Register the OAuth redirect URI
+
+1. On the application detail page, find the **OAuth 2.0** / **Redirect URIs**
+   section.
+2. Add exactly: `http://localhost:8090/callback`
+
+This is the callback address the `oauth` helper listens on during the one-time
+authorization step. It must match exactly.
+
+#### 5 — Find your VIN
+
+The VIN is a 17-character code identifying your specific car. Find it in any
+of these places:
+- **Volvo Cars app** → select your car → Details
+- Dashboard sticker (driver's side, visible through the windshield)
+- Inside the driver's door frame (sticker)
+- Vehicle registration document
 
 ### Tibber mock car
 
