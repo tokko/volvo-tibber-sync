@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Volvo Authorization — volvo-tibber-sync</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 540px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; }
+    h1   { font-size: 1.3rem; margin-bottom: 0.25rem; }
+    p    { color: #555; margin-top: 0.25rem; }
+    pre  { background: #f4f4f4; border: 1px solid #ddd; border-radius: 6px;
+           padding: 14px 16px; font-size: 0.85rem; word-break: break-all;
+           white-space: pre-wrap; margin: 16px 0; }
+    button { background: #1a6ef5; color: #fff; border: none; border-radius: 6px;
+             padding: 8px 18px; font-size: 0.9rem; cursor: pointer; }
+    button:active { background: #1558c0; }
+    .error { color: #c0392b; }
+    .note  { font-size: 0.8rem; color: #888; margin-top: 24px; }
+  </style>
+</head>
+<body>
+  <div id="content"></div>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const code  = params.get('code');
+    const error = params.get('error');
+    const desc  = params.get('error_description') || '';
+    const el    = document.getElementById('content');
+
+    if (error) {
+      el.innerHTML =
+        '<h1 class="error">Authorization failed</h1>' +
+        '<p>' + error + (desc ? ': ' + desc : '') + '</p>' +
+        '<p>Close this tab, check your application settings, and try again.</p>';
+    } else if (code) {
+      el.innerHTML =
+        '<h1>Authorization successful</h1>' +
+        '<p>Copy the code below and paste it into your terminal when prompted.</p>' +
+        '<pre id="code"></pre>' +
+        '<button onclick="copy()">Copy code</button>' +
+        '<p class="note">This page does not send any data anywhere. ' +
+        'The code is only visible to you and expires in a few minutes.</p>';
+      document.getElementById('code').textContent = code;
+    } else {
+      el.innerHTML =
+        '<h1>Nothing here</h1>' +
+        '<p>This page is the OAuth callback for ' +
+        '<a href="https://github.com/tokko/volvo-tibber-sync">volvo-tibber-sync</a>. ' +
+        'It is only useful after you have authorized the app in the Volvo developer portal.</p>';
+    }
+
+    function copy() {
+      const code = document.getElementById('code').textContent;
+      navigator.clipboard.writeText(code).then(function() {
+        document.querySelector('button').textContent = 'Copied!';
+        setTimeout(function() {
+          document.querySelector('button').textContent = 'Copy code';
+        }, 2000);
+      });
+    }
+  </script>
+</body>
+</html>

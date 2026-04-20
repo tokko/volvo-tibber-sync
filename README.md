@@ -45,14 +45,20 @@ From the application detail page, copy:
 
 That Primary Key is your `VOLVO_API_KEY`.
 
-#### 4 — Register the OAuth redirect URI
+#### 4 — Register the OAuth redirect URI and Terms URL
 
-1. On the application detail page, find the **OAuth 2.0** / **Redirect URIs**
-   section.
-2. Add exactly: `http://localhost:8090/callback`
+The portal requires both a redirect URI and a Terms & Conditions URL before it
+will allow the application to authorize users.
 
-This is the callback address the `oauth` helper listens on during the one-time
-authorization step. It must match exactly.
+| Field | Value |
+|---|---|
+| Redirect URI | `https://tokko.github.io/volvo-tibber-sync/callback.html` |
+| Terms & Conditions URL | `https://github.com/tokko/volvo-tibber-sync` |
+
+The redirect URI points to a small GitHub Pages page that reads the
+authorization code from the URL and displays it for copy-paste. No data
+leaves the page. The `oauth` helper then asks you to paste the code into
+the terminal to complete the exchange — no local server or SSH tunnel needed.
 
 #### 5 — Find your VIN
 
@@ -109,21 +115,11 @@ curl -fsSL .../install.sh | RELEASE_TAG=v0.1.0 bash
 1. **Volvo credentials** — prompts for Client ID, Client Secret, VCC-API-Key,
    and VIN (skipped for any value already in `.env`).
 
-2. **Volvo OAuth** — runs the bundled `oauth` helper. It starts a local callback
-   server on `:8090`, prints an authorization URL, and waits for you to open it
-   in a browser.
-
-   > **Headless Pi**: the OAuth callback must reach the Pi's port 8090. Before
-   > pressing Enter in the wizard, open a second terminal on your laptop and
-   > forward the port:
-   > ```
-   > ssh -L 8090:127.0.0.1:8090 pi@<pi-ip>
-   > ```
-   > Then open the URL from the wizard in your laptop's browser. The callback
-   > will tunnel through to the Pi automatically.
-   >
-   > The redirect URI you registered in the developer portal must be
-   > `http://localhost:8090/callback`.
+2. **Volvo OAuth** — runs the bundled `oauth` helper. It prints an
+   authorization URL; open it in any browser (your laptop is fine). After
+   you approve, the browser redirects to a GitHub Pages page that displays
+   the authorization code. Copy it and paste it back into the terminal when
+   prompted. No local server or SSH tunnel needed.
 
 3. **Tibber credentials** — prompts for email and password.
 
@@ -204,11 +200,10 @@ and logs Volvo charge state — the Tibber push is simply skipped.
 
 ## Troubleshooting
 
-**OAuth callback times out** — the `oauth` helper waits 10 minutes for a
-browser redirect. If it times out, check that:
-- the redirect URI in your Volvo app is exactly `http://localhost:8090/callback`
-- the SSH tunnel is open on the right port
-- no firewall blocks 8090 on the Pi
+**OAuth code rejected** — the code shown on the callback page expires in a
+few minutes. If the exchange fails, re-run `./oauth` and complete the flow
+without delay. Also confirm the redirect URI registered in your Volvo app
+is exactly `https://tokko.github.io/volvo-tibber-sync/callback.html`.
 
 **`VOLVO_REFRESH_TOKEN` invalid after a long offline period** — Volvo can
 expire refresh tokens if unused. Re-run the OAuth step:

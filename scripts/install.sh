@@ -148,16 +148,10 @@ prompt_if_blank VOLVO_VIN           "VOLVO_VIN"
 if [[ -z "$(getenv_val VOLVO_REFRESH_TOKEN)" ]]; then
   echo
   say "Running Volvo OAuth2 PKCE flow"
+  echo "   The helper will print an authorization URL. Open it in any browser"
+  echo "   (on your laptop is fine). After authorizing, the browser will land on"
+  echo "   a page showing your authorization code — copy it and paste it here."
   echo
-  echo "   The oauth helper listens on :8090 for the redirect callback. If you're"
-  echo "   SSH'd into a headless Pi, open a second terminal on your laptop first:"
-  echo
-  printf "       %sssh -L 8090:127.0.0.1:8090 %s@%s%s\n" \
-    "$B" "$(whoami)" "$(hostname -I 2>/dev/null | awk '{print $1}')" "$N"
-  echo
-  echo "   Then paste the URL the helper prints into your laptop browser."
-  echo
-  read -r -p "   Press Enter when the tunnel is up (or if you're running locally)… " _ <&3
   ./oauth || die "oauth helper failed"
 else
   say "VOLVO_REFRESH_TOKEN already set — skipping OAuth"

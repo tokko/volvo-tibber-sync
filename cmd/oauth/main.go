@@ -2,6 +2,10 @@
 // flow, exchanges the returned code for an access + refresh token, and writes
 // a .env file the monitor service can consume.
 //
+// The Volvo developer portal does not allow localhost redirect URIs, so the
+// callback goes to a GitHub Pages page that displays the authorization code
+// for copy-paste back into this helper.
+//
 // Usage:
 //
 //	oauth --client-id ... --client-secret ... --api-key ... --vin ...
@@ -10,6 +14,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -17,8 +22,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -29,6 +32,8 @@ import (
 	"github.com/tokko/volvo-tibber-sync/internal/config"
 	"github.com/tokko/volvo-tibber-sync/internal/volvo"
 )
+
+const defaultRedirectURI = "https://tokko.github.io/volvo-tibber-sync/callback.html"
 
 func main() {
 	if err := run(); err != nil {
@@ -41,13 +46,13 @@ func run() error {
 	_ = config.LoadDotEnv(".env")
 
 	var (
-		clientID     = flag.String("client-id", os.Getenv("VOLVO_CLIENT_ID"), "Volvo OAuth2 client id")
+		clientID    = flag.String("client-id", os.Getenv("VOLVO_CLIENT_ID"), "Volvo OAuth2 client id")
 		clientSecret = flag.String("client-secret", os.Getenv("VOLVO_CLIENT_SECRET"), "Volvo OAuth2 client secret")
-		apiKey       = flag.String("api-key", os.Getenv("VOLVO_API_KEY"), "Volvo VCC API key")
-		vin          = flag.String("vin", os.Getenv("VOLVO_VIN"), "Vehicle VIN")
-		port         = flag.Int("port", 8090, "local port for OAuth redirect server")
-		envOut       = flag.String("out", ".env", "path to write the resulting .env file")
-		scopesFlag   = flag.String("scopes", strings.Join(volvo.DefaultScopes, " "), "space-separated OAuth scopes")
+		apiKey      = flag.String("api-key", os.Getenv("VOLVO_API_KEY"), "Volvo VCC API key")
+		vin         = flag.String("vin", os.Getenv("VOLVO_VIN"), "Vehicle VIN")
+		redirectURI = flag.String("redirect-uri", defaultRedirectURI, "OAuth redirect URI registered in the Volvo developer portal")
+		envOut      = flag.String("out", ".env", "path to write the resulting .env file")
+		scopesFlag  = flag.String("scopes", strings.Join(volvo.DefaultScopes, " "), "space-separated OAuth scopes")
 	)
 	flag.Parse()
 
@@ -55,9 +60,6 @@ func run() error {
 		flag.Usage()
 		return errors.New("client-id, client-secret, api-key and vin are required (flags or env)")
 	}
-
-	redirectURI := fmt.Sprintf("http://localhost:%d/callback", *port)
-	fmt.Printf("Redirect URI that must be registered in your Volvo app: %s\n", redirectURI)
 
 	codeVerifier, codeChallenge, err := pkcePair()
 	if err != nil {
@@ -68,73 +70,44 @@ func run() error {
 		return err
 	}
 
-	authURL, err := buildAuthURL(*clientID, redirectURI, *scopesFlag, state, codeChallenge)
+	authURL, err := buildAuthURL(*clientID, *redirectURI, *scopesFlag, state, codeChallenge)
 	if err != nil {
 		return err
 	}
 
-	codeCh := make(chan string, 1)
-	errCh := make(chan error, 1)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		if errStr := q.Get("error"); errStr != "" {
-			msg := fmt.Sprintf("authorization error: %s — %s", errStr, q.Get("error_description"))
-			http.Error(w, msg, http.StatusBadRequest)
-			errCh <- errors.New(msg)
-			return
-		}
-		if got := q.Get("state"); got != state {
-			http.Error(w, "state mismatch", http.StatusBadRequest)
-			errCh <- fmt.Errorf("state mismatch: got %q", got)
-			return
-		}
-		code := q.Get("code")
-		if code == "" {
-			http.Error(w, "missing code", http.StatusBadRequest)
-			errCh <- errors.New("callback missing code")
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write([]byte("<html><body><h2>Volvo OAuth success</h2><p>You can close this tab.</p></body></html>"))
-		codeCh <- code
-	})
-
-	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", *port))
-	if err != nil {
-		return fmt.Errorf("listen on :%d: %w", *port, err)
-	}
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	go func() {
-		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
-		}
-	}()
-	defer srv.Close()
-
 	fmt.Println()
-	fmt.Println("Open this URL in your browser to authorize (it should open automatically):")
+	fmt.Println("Open this URL in your browser to authorize:")
 	fmt.Println()
 	fmt.Println("  " + authURL)
 	fmt.Println()
 	_ = openBrowser(authURL)
+	fmt.Println("After authorizing, the browser will redirect to a page showing an")
+	fmt.Println("authorization code. Copy it and paste it here.")
+	fmt.Println()
+	fmt.Print("Authorization code: ")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-
-	var code string
-	select {
-	case code = <-codeCh:
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
-		return errors.New("timed out waiting for authorization callback")
+	// Read from /dev/tty so this works when stdin is piped (e.g. install.sh).
+	tty, err := os.Open("/dev/tty")
+	if err != nil {
+		tty = os.Stdin
+	} else {
+		defer tty.Close()
+	}
+	sc := bufio.NewScanner(tty)
+	sc.Scan()
+	code := strings.TrimSpace(sc.Text())
+	if code == "" {
+		return errors.New("no authorization code entered")
 	}
 
-	fmt.Println("Got authorization code, exchanging for tokens…")
+	fmt.Println()
+	fmt.Println("Exchanging code for tokens…")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	ts := volvo.NewTokenSource(*clientID, *clientSecret, volvo.Token{}, nil)
-	tok, err := ts.ExchangeCode(ctx, code, codeVerifier, redirectURI)
+	tok, err := ts.ExchangeCode(ctx, code, codeVerifier, *redirectURI)
 	if err != nil {
 		return err
 	}
