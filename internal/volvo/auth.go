@@ -17,16 +17,11 @@ const (
 	TokenURL = "https://volvoid.eu.volvocars.com/as/token.oauth2"
 )
 
-// DefaultScopes covers everything the monitor needs from the Energy API.
-// Only the Energy API subscription is required in the Volvo developer portal —
-// conve:vehicle_relation belongs to the Connected Vehicle API and is not needed.
+// DefaultScopes for the Energy API v2. The single energy:state:read scope
+// grants access to the unified /energy/v2/vehicles/{vin}/state endpoint.
 var DefaultScopes = []string{
 	"openid",
-	"energy:battery_charge_level",
-	"energy:electric_range",
-	"energy:estimated_charging_time",
-	"energy:charging_system_status",
-	"energy:charging_connection_status",
+	"energy:state:read",
 }
 
 type Token struct {
