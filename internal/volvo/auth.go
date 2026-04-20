@@ -17,11 +17,11 @@ const (
 	TokenURL = "https://volvoid.eu.volvocars.com/as/token.oauth2"
 )
 
-// DefaultScopes covers everything the monitor needs from the Energy API plus
-// vehicle listing. Registered app must have these enabled in the Volvo portal.
+// DefaultScopes covers everything the monitor needs from the Energy API.
+// Only the Energy API subscription is required in the Volvo developer portal —
+// conve:vehicle_relation belongs to the Connected Vehicle API and is not needed.
 var DefaultScopes = []string{
 	"openid",
-	"conve:vehicle_relation",
 	"energy:recharge_status",
 	"energy:battery_charge_level",
 	"energy:electric_range",
