@@ -22,7 +22,6 @@ const (
 // conve:vehicle_relation belongs to the Connected Vehicle API and is not needed.
 var DefaultScopes = []string{
 	"openid",
-	"energy:recharge_status",
 	"energy:battery_charge_level",
 	"energy:electric_range",
 	"energy:estimated_charging_time",
