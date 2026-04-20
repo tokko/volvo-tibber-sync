@@ -74,14 +74,23 @@ fetch "env.example" .env.example
 
 chmod +x monitor oauth tibber-discover
 
-# When piped through `curl | bash`, stdin is the pipe (the script itself), not
-# the terminal. Redirect to /dev/tty so `read` prompts reach the user.
-exec < /dev/tty
+# When piped through `curl | bash`, stdin is the pipe (the script itself).
+# Open /dev/tty as fd 3 so each `read` call can pull from the real terminal
+# without touching global stdin (exec < /dev/tty can hang in some SSH setups).
+exec 3</dev/tty || exec 3<&0
 
 # --- .env helpers ---
 if [[ ! -f .env ]]; then
   cp .env.example .env
   chmod 600 .env
+else
+  # A previous aborted run via curl|bash can write script text as values.
+  # Detect this by checking if any value contains whitespace (real creds never do).
+  if grep -qE '^[A-Z_]+=.+ .+' .env 2>/dev/null; then
+    warn ".env contains garbled values from a previous failed run — resetting it."
+    cp .env.example .env
+    chmod 600 .env
+  fi
 fi
 
 getenv_val() {
@@ -118,9 +127,9 @@ prompt_if_blank() {
   if [[ -n "$cur" ]]; then return; fi
   local val
   if [[ "$silent" == "silent" ]]; then
-    read -r -s -p "    $label: " val; echo
+    read -r -s -p "    $label: " val <&3; echo
   else
-    read -r -p "    $label: " val
+    read -r -p "    $label: " val <&3
   fi
   [[ -n "$val" ]] || die "$key is required"
   set_env_key "$key" "$val"
@@ -148,7 +157,7 @@ if [[ -z "$(getenv_val VOLVO_REFRESH_TOKEN)" ]]; then
   echo
   echo "   Then paste the URL the helper prints into your laptop browser."
   echo
-  read -r -p "   Press Enter when the tunnel is up (or if you're running locally)… " _
+  read -r -p "   Press Enter when the tunnel is up (or if you're running locally)… " _ <&3
   ./oauth || die "oauth helper failed"
 else
   say "VOLVO_REFRESH_TOKEN already set — skipping OAuth"
@@ -161,7 +170,7 @@ prompt_if_blank TIBBER_PASSWORD "TIBBER_PASSWORD" silent
 
 if [[ -z "$(getenv_val TIBBER_VEHICLE_ID)" ]]; then
   echo
-  read -r -p "   Substring to match in your Tibber vehicle name (e.g. Ragnar, blank for picker): " MATCH
+  read -r -p "   Substring to match in your Tibber vehicle name (e.g. Ragnar, blank for picker): " MATCH <&3
   if [[ -n "$MATCH" ]]; then
     ./tibber-discover --match "$MATCH"
   else
@@ -184,7 +193,7 @@ printf "    .env        : %s (0600)\n" "$INSTALL_DIR/.env"
 echo
 
 if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
-  read -r -p "Start the service now with 'docker compose up -d --build'? [y/N] " YN
+  read -r -p "Start the service now with 'docker compose up -d --build'? [y/N] " YN <&3
   if [[ "$YN" == "y" || "$YN" == "Y" ]]; then
     docker compose up -d --build
     echo
