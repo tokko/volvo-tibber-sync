@@ -74,6 +74,10 @@ fetch "env.example" .env.example
 
 chmod +x monitor oauth tibber-discover
 
+# When piped through `curl | bash`, stdin is the pipe (the script itself), not
+# the terminal. Redirect to /dev/tty so `read` prompts reach the user.
+exec < /dev/tty
+
 # --- .env helpers ---
 if [[ ! -f .env ]]; then
   cp .env.example .env
