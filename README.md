@@ -27,47 +27,44 @@ If you don't have a Volvo ID, create one at
 
 #### 2 — Create an application
 
-1. Click **Applications** in the top navigation, then **Create application**.
-2. Fill in a name (e.g. `home-charging-sync`) and a short description.
-3. Under **APIs**, tick **Volvo Energy API**. This is the only API needed.
-4. Submit. You'll be taken to the application detail page.
+1. On your [account page](https://developer.volvocars.com/account/), scroll to
+   **Create new application** and give it a name (e.g. `home-charging-sync`).
+2. Click **Create**.
 
-From the application detail page, copy:
-- **Client ID** → `VOLVO_CLIENT_ID`
-- **Client Secret** → `VOLVO_CLIENT_SECRET` (shown once — save it now)
+The new application appears in the list. Click it to expand.
 
 #### 3 — Get the VCC-API-Key
 
-1. On the application detail page, click **View subscriptions** (or navigate to
-   the **Subscriptions** tab).
-2. You should see one subscription for the **Volvo Energy API**.
-3. Click **Show keys** next to it. Copy the **Primary Key**.
+In the expanded application, under **VCC API key - Primary**, click the eye
+icon to reveal the key. Copy it — that is your `VOLVO_API_KEY`.
 
-That Primary Key is your `VOLVO_API_KEY`.
+#### 4 — Get the OAuth client credentials
 
-#### 4 — Register the OAuth redirect URI and Terms URL
+Still in the expanded application, click **Application Client Details** to
+expand that section, then click **Generate new client secret**.
 
-The portal requires both a redirect URI and a Terms & Conditions URL before it
-will allow the application to authorize users.
+After confirming, a dialog shows:
 
-| Field | Value |
-|---|---|
-| Redirect URI | `https://tokko.github.io/volvo-tibber-sync/callback.html` |
-| Terms & Conditions URL | `https://github.com/tokko/volvo-tibber-sync` |
+- **Client ID** → `VOLVO_CLIENT_ID`
+- **Client Secret** → `VOLVO_CLIENT_SECRET` (copy it now — it won't be shown
+  again in full)
 
-The redirect URI points to a small GitHub Pages page that reads the
-authorization code from the URL and displays it for copy-paste. No data
-leaves the page. The `oauth` helper then asks you to paste the code into
-the terminal to complete the exchange — no local server or SSH tunnel needed.
+The redirect URI used by the `oauth` helper
+(`https://tokko.github.io/volvo-tibber-sync/callback.html`) does not need to
+be registered manually; the Volvo ID server accepts it for your application
+automatically.
 
 #### 5 — Find your VIN
 
 The VIN is a 17-character code identifying your specific car. Find it in any
 of these places:
+
 - **Volvo Cars app** → select your car → Details
 - Dashboard sticker (driver's side, visible through the windshield)
 - Inside the driver's door frame (sticker)
 - Vehicle registration document
+
+Watch for look-alike characters: `0` (zero) vs `O` (letter O), `1` vs `I`.
 
 ### Tibber mock car
 
@@ -107,7 +104,7 @@ curl -fsSL .../install.sh | INSTALL_DIR=/opt/volvo-tibber-sync bash
 Pin a specific release version:
 
 ```bash
-curl -fsSL .../install.sh | RELEASE_TAG=v0.1.0 bash
+curl -fsSL .../install.sh | RELEASE_TAG=v0.2.0 bash
 ```
 
 ### What the wizard does
@@ -127,7 +124,7 @@ curl -fsSL .../install.sh | RELEASE_TAG=v0.1.0 bash
    vehicles on your account. You can supply a substring to auto-select your
    mock car (e.g. `Ragnar`), or pick interactively.
 
-5. **Start** — offers to run `docker compose up -d --build`.
+5. **Start** — offers to run `docker compose up -d`.
 
 Re-running the installer is safe: any key already present in `.env` is
 preserved and its prompt is skipped.
@@ -142,12 +139,6 @@ cd ~/volvo-tibber-sync
 # View live logs
 docker compose logs -f
 
-# Check charge state
-curl -s http://localhost:8080/state | jq
-
-# Health check
-curl -s http://localhost:8080/healthz
-
 # Restart
 docker compose restart
 
@@ -156,7 +147,7 @@ docker compose down
 
 # Upgrade to a new release
 curl -fsSL https://raw.githubusercontent.com/tokko/volvo-tibber-sync/main/scripts/install.sh | bash
-docker compose up -d --build
+docker compose up -d
 ```
 
 ### Poll interval
@@ -164,6 +155,23 @@ docker compose up -d --build
 The default poll interval is **3 hours** (`POLL_INTERVAL=3h` in `.env`). Edit
 `.env` and restart the container to change it. Accepts any Go duration string:
 `30m`, `1h30m`, etc.
+
+### HTTP status endpoints
+
+The monitor can optionally expose `/healthz` and `/state` endpoints. They are
+**disabled by default**. To enable, set `HTTP_ADDR` in `.env`:
+
+```bash
+HTTP_ADDR=:8080
+```
+
+Then expose the port in `docker-compose.yml` under `ports` and restart. Once
+running:
+
+```bash
+curl -s http://localhost:8080/state | jq
+curl -s http://localhost:8080/healthz
+```
 
 ---
 
@@ -187,7 +195,7 @@ installer).
 | `POLL_INTERVAL` | no | `3h` | How often to read charge state |
 | `TOKEN_STORE_PATH` | no | `/data/token.json` | Where Volvo token is persisted |
 | `TIBBER_TOKEN_STORE_PATH` | no | `/data/tibber-token.json` | Where Tibber JWT is persisted |
-| `HTTP_ADDR` | no | `:8080` | Address for the `/healthz` + `/state` HTTP server |
+| `HTTP_ADDR` | no | *(disabled)* | Set to e.g. `:8080` to enable `/healthz` + `/state` |
 
 Tokens are persisted to the `/data` volume so restarts don't require
 re-authentication. Volvo refresh tokens are rotated automatically; Tibber JWTs
@@ -202,8 +210,7 @@ and logs Volvo charge state — the Tibber push is simply skipped.
 
 **OAuth code rejected** — the code shown on the callback page expires in a
 few minutes. If the exchange fails, re-run `./oauth` and complete the flow
-without delay. Also confirm the redirect URI registered in your Volvo app
-is exactly `https://tokko.github.io/volvo-tibber-sync/callback.html`.
+without delay.
 
 **`VOLVO_REFRESH_TOKEN` invalid after a long offline period** — Volvo can
 expire refresh tokens if unused. Re-run the OAuth step:
@@ -212,6 +219,11 @@ cd ~/volvo-tibber-sync
 ./oauth
 docker compose restart
 ```
+
+**`VEHICLE_NOT_FOUND` from Volvo API** — the VIN in `.env` doesn't match
+any vehicle on your Volvo account. Double-check `VOLVO_VIN` character by
+character against the Volvo Cars app (car → Details). Common mistake: `O`
+(letter) vs `0` (zero).
 
 **Tibber push fails** — the Tibber app API is undocumented. If it stops
 working after a Tibber app update, check the [issues](https://github.com/tokko/volvo-tibber-sync/issues)
@@ -239,11 +251,14 @@ go build ./cmd/...
 
 # Cross-compile arm64 (requires Go toolchain, no Docker needed)
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o dist/monitor-linux-arm64 ./cmd/monitor
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o dist/oauth-linux-arm64 ./cmd/oauth
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o dist/tibber-discover-linux-arm64 ./cmd/tibber-discover
 ```
 
 ### Cut a release
 
-Requires `gh` authenticated as a user with push access:
+Requires `gh` authenticated as a user with push access and the Go toolchain
+on `PATH`:
 
 ```bash
 ./scripts/release.sh v0.2.0

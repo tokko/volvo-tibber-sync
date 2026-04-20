@@ -1,29 +1,21 @@
 services:
   monitor:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      platforms:
-        - linux/arm64
-    image: volvo-charge-monitor:latest
+    image: gcr.io/distroless/static-debian12
+    entrypoint: ["/monitor"]
     container_name: volvo-charge-monitor
     restart: unless-stopped
     env_file:
       - .env
     volumes:
+      - ./monitor:/monitor:ro
       - token-data:/data
-    ports:
-      - "8080:8080"
 
-    # Hardening — the binary only reads env and writes to /data.
     read_only: true
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
 
-    # Pi 5 sanity limits — the monitor idles at a few MB of RSS; this caps
-    # any runaway and leaves headroom for the rest of the Pi's workload.
     deploy:
       resources:
         limits:
@@ -32,8 +24,6 @@ services:
         reservations:
           memory: 32M
 
-    # Rely on `restart: unless-stopped` — distroless has no shell or curl,
-    # so a HEALTHCHECK exec is awkward. External monitors can hit /healthz.
     logging:
       driver: json-file
       options:

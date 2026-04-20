@@ -23,31 +23,41 @@ func NewClient(s *Session) *Client {
 }
 
 type Vehicle struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	Model        string `json:"model,omitempty"`
-	BatteryLevel int    `json:"batteryLevel"`
-	Connected    bool   `json:"connected"`
-	Charging     bool   `json:"charging"`
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	ShortName string `json:"shortName"`
+}
+
+// DisplayName returns the most descriptive available name for the vehicle.
+func (v Vehicle) DisplayName() string {
+	if v.ShortName != "" && v.ShortName != v.Title {
+		return v.ShortName + " (" + v.Title + ")"
+	}
+	if v.Title != "" {
+		return v.Title
+	}
+	return v.ID
 }
 
 type Home struct {
-	ID          string    `json:"id"`
-	AppNickname string    `json:"appNickname"`
-	Vehicles    []Vehicle `json:"vehicles"`
+	ID string `json:"id"`
 }
 
-const listHomesQuery = `query ListHomesVehicles {
+const listHomesQuery = `query ListHomes {
   me {
     homes {
       id
-      appNickname
+    }
+  }
+}`
+
+const listVehiclesQuery = `query ListVehicles {
+  me {
+    myVehicles {
       vehicles {
         id
-        name
-        batteryLevel
-        connected
-        charging
+        title
+        shortName
       }
     }
   }
@@ -61,7 +71,7 @@ const setVehicleSettingsMutation = `mutation SetVehicleSettings($vehicleId: Stri
   }
 }`
 
-// ListHomes returns every home on the account along with its vehicles.
+// ListHomes returns every home ID on the account.
 func (c *Client) ListHomes(ctx context.Context) ([]Home, error) {
 	var out struct {
 		Me struct {
@@ -72,6 +82,21 @@ func (c *Client) ListHomes(ctx context.Context) ([]Home, error) {
 		return nil, err
 	}
 	return out.Me.Homes, nil
+}
+
+// ListVehicles returns all electric vehicles linked to the account.
+func (c *Client) ListVehicles(ctx context.Context) ([]Vehicle, error) {
+	var out struct {
+		Me struct {
+			MyVehicles struct {
+				Vehicles []Vehicle `json:"vehicles"`
+			} `json:"myVehicles"`
+		} `json:"me"`
+	}
+	if err := c.do(ctx, listVehiclesQuery, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Me.MyVehicles.Vehicles, nil
 }
 
 // SetBatteryLevel writes the supplied state-of-charge percentage against the

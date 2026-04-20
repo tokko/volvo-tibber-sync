@@ -14,7 +14,7 @@
 #      .env (existing values are kept — re-running the script is safe).
 #   3. Runs the bundled `oauth` helper to complete the Volvo PKCE flow.
 #   4. Runs the bundled `tibber-discover` helper to pick the mock-car vehicle.
-#   5. Offers to bring the stack up via `docker compose up -d --build`.
+#   5. Offers to bring the stack up via `docker compose up -d`.
 
 set -euo pipefail
 
@@ -187,17 +187,17 @@ printf "    .env        : %s (0600)\n" "$INSTALL_DIR/.env"
 echo
 
 if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
-  read -r -p "Start the service now with 'docker compose up -d --build'? [y/N] " YN <&3
+  read -r -p "Start the service now with 'docker compose up -d'? [y/N] " YN <&3
   if [[ "$YN" == "y" || "$YN" == "Y" ]]; then
-    docker compose up -d --build
+    docker compose up -d
     echo
     say "Service started."
     echo "    logs:  cd $INSTALL_DIR && docker compose logs -f"
     echo "    state: http://localhost:8080/state"
   else
-    say "When you're ready: cd $INSTALL_DIR && docker compose up -d --build"
+    say "When you're ready: cd $INSTALL_DIR && docker compose up -d"
   fi
 else
   warn "docker compose not available — install docker, then:"
-  warn "   cd $INSTALL_DIR && docker compose up -d --build"
+  warn "   cd $INSTALL_DIR && docker compose up -d"
 fi

@@ -73,7 +73,7 @@ func run() error {
 	}
 	tokenStore := config.Optional("TOKEN_STORE_PATH", "/data/token.json")
 	tibberStore := config.Optional("TIBBER_TOKEN_STORE_PATH", "/data/tibber-token.json")
-	httpAddr := config.Optional("HTTP_ADDR", ":8080")
+	httpAddr := config.Optional("HTTP_ADDR", "")
 
 	// Use stored token if present (survives restarts and keeps any rotated refresh
 	// token), otherwise bootstrap from env.
@@ -86,6 +86,7 @@ func run() error {
 	latest := &latestState{}
 
 	ts := volvo.NewTokenSource(clientID, clientSecret, initial, func(t volvo.Token) {
+		slog.Info("volvo token refreshed", "expires_at", t.ExpiresAt)
 		if err := saveStoredToken(tokenStore, t); err != nil {
 			slog.Warn("could not persist refreshed volvo token", "path", tokenStore, "err", err)
 		}
@@ -97,7 +98,9 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	go serveHTTP(ctx, httpAddr, latest)
+	if httpAddr != "" {
+		go serveHTTP(ctx, httpAddr, latest)
+	}
 
 	slog.Info("starting monitor",
 		"vin", vin,
@@ -110,6 +113,7 @@ func run() error {
 	)
 
 	pollOnce := func() {
+		slog.Info("poll starting", "vin", vin)
 		pCtx, pCancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer pCancel()
 		state := client.FetchChargeState(pCtx)
@@ -263,6 +267,7 @@ func buildTibberClient(tokenStorePath string) (*tibber.Client, tibberConfig) {
 		slog.Info("loaded tibber token from store", "path", tokenStorePath, "expires_at", stored.ExpiresAt)
 	}
 	sess.SetOnRefresh(func(token string, expiresAt time.Time) {
+		slog.Info("tibber token refreshed", "expires_at", expiresAt)
 		if err := saveTibberToken(tokenStorePath, tibberToken{Token: token, ExpiresAt: expiresAt}); err != nil {
 			slog.Warn("could not persist tibber token", "path", tokenStorePath, "err", err)
 		}

@@ -48,8 +48,8 @@ type resourceFloat struct {
 }
 
 type resourceInt struct {
-	Status string `json:"status"`
-	Value  int    `json:"value"`
+	Status string  `json:"status"`
+	Value  float64 `json:"value"`
 }
 
 type resourceString struct {
@@ -107,11 +107,11 @@ func (c *Client) FetchChargeState(ctx context.Context) ChargeState {
 		state.BatteryChargeLevelPct = &v
 	}
 	if e.ElectricRange.Status == "OK" {
-		v := e.ElectricRange.Value
+		v := int(e.ElectricRange.Value)
 		state.ElectricRangeKm = &v
 	}
 	if e.EstimatedChargingTimeToTargetBatteryCharge.Status == "OK" {
-		v := e.EstimatedChargingTimeToTargetBatteryCharge.Value
+		v := int(e.EstimatedChargingTimeToTargetBatteryCharge.Value)
 		state.EstimatedChargingTimeMin = &v
 	}
 	if e.ChargingStatus.Status == "OK" {

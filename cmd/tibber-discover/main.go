@@ -34,7 +34,7 @@ func run() error {
 
 	email := flag.String("email", os.Getenv("TIBBER_EMAIL"), "Tibber account email")
 	password := flag.String("password", os.Getenv("TIBBER_PASSWORD"), "Tibber account password (use env TIBBER_PASSWORD to avoid shell history)")
-	match := flag.String("match", "", "optional substring to match against vehicle name (case-insensitive); e.g. --match Ragnar")
+	match := flag.String("match", "", "optional substring to match against vehicle title (case-insensitive); e.g. --match Ragnar")
 	envOut := flag.String("out", ".env", "path to merge selection into; empty to just print")
 	flag.Parse()
 
@@ -51,67 +51,59 @@ func run() error {
 
 	homes, err := client.ListHomes(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("list homes: %w", err)
 	}
 	if len(homes) == 0 {
 		return errors.New("no homes returned; is the account correct?")
 	}
 
-	type row struct {
-		homeIdx, vehIdx int
-		home            tibber.Home
-		veh             tibber.Vehicle
+	vehicles, err := client.ListVehicles(ctx)
+	if err != nil {
+		return fmt.Errorf("list vehicles: %w", err)
 	}
-	var rows []row
+	if len(vehicles) == 0 {
+		return errors.New("no vehicles found on this account — link your car in the Tibber app first")
+	}
+
 	fmt.Println()
-	fmt.Println("Tibber homes and vehicles on this account:")
+	fmt.Println("Tibber homes on this account:")
 	fmt.Println()
 	for hi, h := range homes {
-		nick := h.AppNickname
-		if nick == "" {
-			nick = "(unnamed home)"
-		}
-		fmt.Printf("Home %d: %s  [id=%s]\n", hi, nick, h.ID)
-		if len(h.Vehicles) == 0 {
-			fmt.Println("  (no vehicles linked)")
-			continue
-		}
-		for vi, v := range h.Vehicles {
-			rows = append(rows, row{homeIdx: hi, vehIdx: vi, home: h, veh: v})
-			idx := len(rows) - 1
-			tag := ""
-			if *match != "" && strings.Contains(strings.ToLower(v.Name), strings.ToLower(*match)) {
-				tag = "  ← matches --match"
-			}
-			fmt.Printf("  [%d] %s  battery=%d%%  connected=%v  charging=%v  [vehicle_id=%s]%s\n",
-				idx, v.Name, v.BatteryLevel, v.Connected, v.Charging, v.ID, tag)
-		}
+		fmt.Printf("  [%d] home id=%s\n", hi, h.ID)
 	}
-	if len(rows) == 0 {
-		return errors.New("no vehicles found on any home — link your car in the Tibber app first")
+
+	fmt.Println()
+	fmt.Println("Electric vehicles on this account:")
+	fmt.Println()
+	for vi, v := range vehicles {
+		tag := ""
+		if *match != "" && strings.Contains(strings.ToLower(v.DisplayName()), strings.ToLower(*match)) {
+			tag = "  ← matches --match"
+		}
+		fmt.Printf("  [%d] %s  [vehicle_id=%s]%s\n", vi, v.DisplayName(), v.ID, tag)
 	}
 	fmt.Println()
 
-	// Autoselect if --match hits exactly one row.
-	selected := -1
+	// Select vehicle.
+	selectedVeh := -1
 	if *match != "" {
 		hits := 0
-		for i, r := range rows {
-			if strings.Contains(strings.ToLower(r.veh.Name), strings.ToLower(*match)) {
-				selected = i
+		for i, v := range vehicles {
+			if strings.Contains(strings.ToLower(v.DisplayName()), strings.ToLower(*match)) {
+				selectedVeh = i
 				hits++
 			}
 		}
 		if hits == 0 {
-			return fmt.Errorf("--match %q did not match any vehicle name", *match)
+			return fmt.Errorf("--match %q did not match any vehicle title", *match)
 		}
 		if hits > 1 {
 			return fmt.Errorf("--match %q matched %d vehicles; be more specific", *match, hits)
 		}
-		fmt.Printf("Auto-selected row %d (%s) via --match.\n", selected, rows[selected].veh.Name)
+		fmt.Printf("Auto-selected vehicle %d (%s) via --match.\n", selectedVeh, vehicles[selectedVeh].DisplayName())
 	} else {
-		fmt.Printf("Enter the row number to save as TIBBER_HOME_ID / TIBBER_VEHICLE_ID (or blank to skip): ")
 		sc := bufio.NewScanner(os.Stdin)
+		fmt.Printf("Enter vehicle row number to save (or blank to skip): ")
 		if sc.Scan() {
 			txt := strings.TrimSpace(sc.Text())
 			if txt == "" {
@@ -119,29 +111,49 @@ func run() error {
 				return nil
 			}
 			n, err := strconv.Atoi(txt)
-			if err != nil || n < 0 || n >= len(rows) {
+			if err != nil || n < 0 || n >= len(vehicles) {
 				return fmt.Errorf("invalid row number %q", txt)
 			}
-			selected = n
+			selectedVeh = n
 		}
 	}
 
-	r := rows[selected]
+	// Select home: auto if only one, else prompt.
+	selectedHome := 0
+	if len(homes) > 1 {
+		sc := bufio.NewScanner(os.Stdin)
+		fmt.Printf("Enter home row number to associate with this vehicle: ")
+		if sc.Scan() {
+			txt := strings.TrimSpace(sc.Text())
+			n, err := strconv.Atoi(txt)
+			if err != nil || n < 0 || n >= len(homes) {
+				return fmt.Errorf("invalid row number %q", txt)
+			}
+			selectedHome = n
+		}
+	} else {
+		fmt.Printf("Using only home: %s\n", homes[0].ID)
+	}
+
+	veh := vehicles[selectedVeh]
+	home := homes[selectedHome]
+
 	if *envOut == "" {
 		fmt.Printf("\nTIBBER_HOME_ID=%s\nTIBBER_VEHICLE_ID=%s\nTIBBER_VEHICLE_NAME=%s\n",
-			r.home.ID, r.veh.ID, r.veh.Name)
+			home.ID, veh.ID, veh.Title)
 		return nil
 	}
 
 	if err := config.UpdateDotEnv(*envOut, map[string]string{
 		"TIBBER_EMAIL":        *email,
 		"TIBBER_PASSWORD":     *password,
-		"TIBBER_HOME_ID":      r.home.ID,
-		"TIBBER_VEHICLE_ID":   r.veh.ID,
-		"TIBBER_VEHICLE_NAME": r.veh.Name,
+		"TIBBER_HOME_ID":      home.ID,
+		"TIBBER_VEHICLE_ID":   veh.ID,
+		"TIBBER_VEHICLE_NAME": veh.DisplayName(),
 	}); err != nil {
 		return fmt.Errorf("write %s: %w", *envOut, err)
 	}
-	fmt.Printf("Wrote %s (TIBBER_HOME_ID, TIBBER_VEHICLE_ID=%s — %s).\n", *envOut, r.veh.ID, r.veh.Name)
+	fmt.Printf("Wrote %s (TIBBER_HOME_ID=%s, TIBBER_VEHICLE_ID=%s — %s).\n",
+		*envOut, home.ID, veh.ID, veh.DisplayName())
 	return nil
 }
