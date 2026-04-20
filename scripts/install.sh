@@ -69,7 +69,8 @@ fetch "oauth-$PLATFORM"           oauth
 fetch "tibber-discover-$PLATFORM" tibber-discover
 fetch "Dockerfile"
 fetch "docker-compose.yml"
-fetch ".env.example"
+# GitHub renames dotfile release assets — .env.example is uploaded as env.example.
+fetch "env.example" .env.example
 
 chmod +x monitor oauth tibber-discover
 

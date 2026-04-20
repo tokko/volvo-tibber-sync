@@ -40,6 +40,10 @@ mv dist/tibber-discover dist/tibber-discover-linux-arm64
 file dist/monitor-linux-arm64 | grep -q "ARM aarch64" \
   || { echo "build did not produce an arm64 binary — check docker buildx setup" >&2; exit 1; }
 
+# GitHub renames dotfiles in release assets (e.g. .env.example → default.env.example).
+# Upload as env.example so install.sh can fetch it at a predictable name.
+cp .env.example dist/env.example
+
 gh release create "$TAG" \
   --title "$TAG" \
   --generate-notes \
@@ -48,7 +52,7 @@ gh release create "$TAG" \
   dist/tibber-discover-linux-arm64 \
   Dockerfile \
   docker-compose.yml \
-  .env.example
+  dist/env.example
 
 echo
 echo "Released $TAG. Pi install one-liner:"
