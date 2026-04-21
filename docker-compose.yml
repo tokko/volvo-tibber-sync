@@ -8,7 +8,16 @@ services:
       - .env
     volumes:
       - ./monitor:/monitor:ro
-      - token-data:/data
+      # Bind-mount so ./data/token.json on the host is visible inside the
+      # container. The oauth helper seeds token.json here so the monitor
+      # never has to fall back to the one-shot .env refresh token.
+      - ./data:/data
+
+    # Expose HTTP endpoints (/healthz, /state, /logs) when HTTP_ADDR=:8080 in
+    # .env. Host port 8082 → container port 8080 (8080 is used by another
+    # container on this host). Comment out to keep the service fully private.
+    ports:
+      - "8082:8080"
 
     read_only: true
     security_opt:
@@ -30,5 +39,3 @@ services:
         max-size: "10m"
         max-file: "5"
 
-volumes:
-  token-data:

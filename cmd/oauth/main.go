@@ -19,12 +19,14 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -52,6 +54,7 @@ func run() error {
 		vin         = flag.String("vin", os.Getenv("VOLVO_VIN"), "Vehicle VIN")
 		redirectURI = flag.String("redirect-uri", defaultRedirectURI, "OAuth redirect URI registered in the Volvo developer portal")
 		envOut      = flag.String("out", ".env", "path to write the resulting .env file")
+		tokenOut    = flag.String("token-out", "./data/token.json", "path to seed the monitor token store (bind-mounted to /data)")
 		scopesFlag  = flag.String("scopes", strings.Join(volvo.DefaultScopes, " "), "space-separated OAuth scopes")
 	)
 	flag.Parse()
@@ -123,7 +126,33 @@ func run() error {
 		return fmt.Errorf("write %s: %w", *envOut, err)
 	}
 	fmt.Printf("Wrote %s — keep this file secret.\n", *envOut)
+
+	// Seed the token store the monitor reads at startup. This avoids the
+	// fragile one-shot env-bootstrap: the first refresh_token Volvo issued
+	// is already persisted, so a container restart never re-consumes a token
+	// that was rotated in a prior run.
+	if err := writeTokenStore(*tokenOut, tok); err != nil {
+		return fmt.Errorf("write token store %s: %w", *tokenOut, err)
+	}
+	fmt.Printf("Seeded %s — monitor will load this on startup.\n", *tokenOut)
 	return nil
+}
+
+func writeTokenStore(path string, tok volvo.Token) error {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	b, err := json.MarshalIndent(tok, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func buildAuthURL(clientID, redirectURI, scopes, state, challenge string) (string, error) {

@@ -13,10 +13,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -31,10 +34,15 @@ var (
 	flagDryRun  = flag.Bool("dry-run", false, "fetch Volvo state and log the intended Tibber push, but do not call Tibber")
 )
 
+// logRing is a global capped ring buffer of emitted log lines, so the /logs
+// HTTP endpoint can return recent entries without shelling into Docker.
+var logRing = newLogRingBuffer(500)
+
 func main() {
 	flag.Parse()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	w := io.MultiWriter(os.Stdout, logRing)
+	logger := slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
 	_ = config.LoadDotEnv(".env")
@@ -81,6 +89,12 @@ func run() error {
 	if stored, ok := loadStoredToken(tokenStore); ok {
 		initial = stored
 		slog.Info("loaded token from store", "path", tokenStore, "expires_at", initial.ExpiresAt)
+	} else {
+		// Volvo rotates refresh tokens on use — if this env token has already
+		// been consumed by a prior run, the first refresh will fail. The oauth
+		// helper should seed token.json so we never take this path on a
+		// healthy setup.
+		slog.Warn("no stored token — bootstrapping from env VOLVO_REFRESH_TOKEN (one-shot; re-run ./oauth if first refresh fails with invalid_grant)", "path", tokenStore)
 	}
 
 	latest := &latestState{}
@@ -88,7 +102,7 @@ func run() error {
 	ts := volvo.NewTokenSource(clientID, clientSecret, initial, func(t volvo.Token) {
 		slog.Info("volvo token refreshed", "expires_at", t.ExpiresAt)
 		if err := saveStoredToken(tokenStore, t); err != nil {
-			slog.Warn("could not persist refreshed volvo token", "path", tokenStore, "err", err)
+			slog.Error("could not persist refreshed volvo token — next restart will fall back to env token and may fail with invalid_grant", "path", tokenStore, "err", err)
 		}
 	})
 	client := volvo.NewClient(ts, apiKey, vin)
@@ -186,10 +200,24 @@ func logState(s volvo.ChargeState) {
 	}
 	if len(s.Errors) > 0 {
 		attrs = append(attrs, "errors", s.Errors)
+		if anyInvalidGrant(s.Errors) {
+			attrs = append(attrs, "action_required", "run ./oauth on the host and restart the container (refresh token was rejected by Volvo)")
+			slog.Error("volvo refresh token rejected (invalid_grant) — re-auth required", attrs...)
+			return
+		}
 		slog.Warn("charge state (partial)", attrs...)
 		return
 	}
 	slog.Info("charge state", attrs...)
+}
+
+func anyInvalidGrant(errs []string) bool {
+	for _, e := range errs {
+		if strings.Contains(e, "invalid_grant") {
+			return true
+		}
+	}
+	return false
 }
 
 func loadStoredToken(path string) (volvo.Token, bool) {
@@ -346,6 +374,20 @@ func serveHTTP(ctx context.Context, addr string, latest *latestState) {
 		}
 		_ = json.NewEncoder(w).Encode(s)
 	})
+	mux.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
+		// Return recent log lines (already JSON-per-line from slog JSONHandler).
+		// ?limit=N caps the number of most-recent entries returned.
+		limit := 0
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		for _, line := range logRing.Snapshot(limit) {
+			_, _ = w.Write(line)
+		}
+	})
 
 	srv := &http.Server{
 		Addr:              addr,
@@ -361,4 +403,50 @@ func serveHTTP(ctx context.Context, addr string, latest *latestState) {
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("http server failed", "err", err)
 	}
+}
+
+// logRingBuffer is an io.Writer that keeps the last N writes in memory. Each
+// Write is treated as one log entry — slog.JSONHandler calls Write exactly
+// once per record, so entries do not get split across writes.
+type logRingBuffer struct {
+	mu   sync.Mutex
+	buf  [][]byte
+	cap  int
+	next int
+	size int
+}
+
+func newLogRingBuffer(capacity int) *logRingBuffer {
+	return &logRingBuffer{cap: capacity, buf: make([][]byte, capacity)}
+}
+
+func (r *logRingBuffer) Write(p []byte) (int, error) {
+	entry := make([]byte, len(p))
+	copy(entry, p)
+	r.mu.Lock()
+	r.buf[r.next] = entry
+	r.next = (r.next + 1) % r.cap
+	if r.size < r.cap {
+		r.size++
+	}
+	r.mu.Unlock()
+	return len(p), nil
+}
+
+// Snapshot returns up to limit of the most recent entries in chronological
+// order. limit <= 0 returns all buffered entries.
+func (r *logRingBuffer) Snapshot(limit int) [][]byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := r.size
+	if limit > 0 && limit < n {
+		n = limit
+	}
+	out := make([][]byte, 0, n)
+	// Start index so we walk from oldest-of-n to newest.
+	start := (r.next - n + r.cap) % r.cap
+	for i := 0; i < n; i++ {
+		out = append(out, r.buf[(start+i)%r.cap])
+	}
+	return out
 }

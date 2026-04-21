@@ -13,6 +13,12 @@ token.json
 *.test
 *.out
 vendor/
+monitor-linux-arm64
+oauth-linux-arm64
+tibber-discover-linux-arm64
+
+# Bind-mount target for the monitor's token store.
+/data/
 
 # Editors / OS.
 .idea/

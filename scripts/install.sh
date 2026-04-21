@@ -52,6 +52,11 @@ fi
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
+# Bind-mount target for the token store. Created up-front so docker doesn't
+# auto-create it as root; oauth seeds ./data/token.json during the wizard.
+mkdir -p data
+chmod 700 data
+
 if [[ "$RELEASE_TAG" == "latest" ]]; then
   BASE="https://github.com/$REPO/releases/latest/download"
 else
@@ -193,7 +198,7 @@ if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
     echo
     say "Service started."
     echo "    logs:  cd $INSTALL_DIR && docker compose logs -f"
-    echo "    state: http://localhost:8080/state"
+    echo "    HTTP:  http://localhost:8082/state   http://localhost:8082/logs"
   else
     say "When you're ready: cd $INSTALL_DIR && docker compose up -d"
   fi

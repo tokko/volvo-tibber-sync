@@ -158,20 +158,21 @@ The default poll interval is **3 hours** (`POLL_INTERVAL=3h` in `.env`). Edit
 
 ### HTTP status endpoints
 
-The monitor can optionally expose `/healthz` and `/state` endpoints. They are
-**disabled by default**. To enable, set `HTTP_ADDR` in `.env`:
+The monitor exposes `/healthz`, `/state`, and `/logs` on the port set by
+`HTTP_ADDR` in `.env` (default `:8080` inside the container, mapped to host
+**8082** by `docker-compose.yml`). Comment out the `ports:` block to keep
+the service fully private.
 
 ```bash
-HTTP_ADDR=:8080
+curl -s http://localhost:8082/healthz
+curl -s http://localhost:8082/state | jq
+curl -s 'http://localhost:8082/logs?limit=50'   # recent JSON log lines
 ```
 
-Then expose the port in `docker-compose.yml` under `ports` and restart. Once
-running:
-
-```bash
-curl -s http://localhost:8080/state | jq
-curl -s http://localhost:8080/healthz
-```
+`/logs` returns up to the last ~500 emitted log entries (newline-delimited
+JSON, same format as stdout). `?limit=N` caps the response to the N most
+recent entries. Change the left-hand side of `ports:` in compose if 8082 is
+already taken on your host.
 
 ---
 
@@ -195,11 +196,14 @@ installer).
 | `POLL_INTERVAL` | no | `3h` | How often to read charge state |
 | `TOKEN_STORE_PATH` | no | `/data/token.json` | Where Volvo token is persisted |
 | `TIBBER_TOKEN_STORE_PATH` | no | `/data/tibber-token.json` | Where Tibber JWT is persisted |
-| `HTTP_ADDR` | no | *(disabled)* | Set to e.g. `:8080` to enable `/healthz` + `/state` |
+| `HTTP_ADDR` | no | `:8080` | HTTP listen address inside the container (leave empty to disable) |
 
-Tokens are persisted to the `/data` volume so restarts don't require
-re-authentication. Volvo refresh tokens are rotated automatically; Tibber JWTs
-are refreshed before they expire (~18 h TTL).
+Tokens are persisted to `./data/` on the host (bind-mounted into the
+container at `/data`) so restarts don't require re-authentication. Volvo
+refresh tokens are rotated automatically; Tibber JWTs are refreshed before
+they expire (~18 h TTL). `./oauth` seeds `./data/token.json` directly so the
+monitor never has to fall back to the one-shot `VOLVO_REFRESH_TOKEN` from
+`.env`.
 
 If Tibber is not configured (all `TIBBER_*` vars blank) the monitor still runs
 and logs Volvo charge state — the Tibber push is simply skipped.
@@ -212,13 +216,21 @@ and logs Volvo charge state — the Tibber push is simply skipped.
 few minutes. If the exchange fails, re-run `./oauth` and complete the flow
 without delay.
 
-**`VOLVO_REFRESH_TOKEN` invalid after a long offline period** — Volvo can
-expire refresh tokens if unused. Re-run the OAuth step:
+**`VOLVO_REFRESH_TOKEN` invalid / `invalid_grant` in logs** — Volvo rotates
+refresh tokens on every use, so the token the monitor last used is persisted
+to `./data/token.json` (bind-mounted into the container at `/data`). If that
+file is deleted, or if a prior run consumed the env's one-shot bootstrap
+token, the next refresh will fail. Re-authenticate:
 ```bash
 cd ~/volvo-tibber-sync
-./oauth
+./oauth                    # writes both .env and ./data/token.json
 docker compose restart
 ```
+
+Starting in v0.3, `./oauth` seeds `./data/token.json` directly, so the
+monitor never has to fall back to the env bootstrap on a healthy setup. The
+monitor logs at `ERROR` level when it sees `invalid_grant` so the condition
+is visible in `curl http://<host>:8082/logs`.
 
 **`VEHICLE_NOT_FOUND` from Volvo API** — the VIN in `.env` doesn't match
 any vehicle on your Volvo account. Double-check `VOLVO_VIN` character by
@@ -266,3 +278,11 @@ on `PATH`:
 
 This cross-compiles all three arm64 binaries and creates a GitHub release with
 the binaries, Dockerfile, docker-compose.yml, and .env.example as assets.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE). Not affiliated with Volvo Cars or Tibber; the
+Tibber integration uses the undocumented app API and may break when Tibber
+updates their app.
