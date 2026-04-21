@@ -65,6 +65,17 @@ func (s *Session) Seed(token string, expiresAt time.Time) {
 	s.expiresAt = expiresAt
 }
 
+// Invalidate clears the cached token so the next Token() call re-logs in.
+// Use this when the server rejects the token (e.g. a 401 — Tibber invalidates
+// prior sessions when the user logs in on another device, long before our
+// hardcoded TTL would have expired).
+func (s *Session) Invalidate() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.token = ""
+	s.expiresAt = time.Time{}
+}
+
 // Token returns a valid JWT, re-authenticating if the cached one is missing
 // or close to expiring.
 func (s *Session) Token(ctx context.Context) (string, error) {

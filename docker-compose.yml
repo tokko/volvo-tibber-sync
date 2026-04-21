@@ -4,6 +4,10 @@ services:
     entrypoint: ["/monitor"]
     container_name: volvo-charge-monitor
     restart: unless-stopped
+    # Run as the host user that owns ./data (uid 1000 on a default Pi).
+    # Needed because cap_drop: ALL strips CAP_DAC_OVERRIDE — without it,
+    # container-root cannot write to a bind mount owned by a non-root uid.
+    user: "1000:1000"
     env_file:
       - .env
     volumes:

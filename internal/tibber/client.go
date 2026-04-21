@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -120,6 +121,19 @@ type gqlError struct {
 }
 
 func (c *Client) do(ctx context.Context, query string, vars map[string]any, out any) error {
+	// First attempt with whatever token we have cached, plus one retry after
+	// forced re-login on an auth failure. Tibber invalidates prior sessions
+	// whenever the user logs in elsewhere (e.g. opens the app on a new phone),
+	// long before our hardcoded TTL would have expired, so we must recover.
+	err := c.doOnce(ctx, query, vars, out)
+	if err != nil && isAuthFailure(err) {
+		c.session.Invalidate()
+		err = c.doOnce(ctx, query, vars, out)
+	}
+	return err
+}
+
+func (c *Client) doOnce(ctx context.Context, query string, vars map[string]any, out any) error {
 	tok, err := c.session.Token(ctx)
 	if err != nil {
 		return err
@@ -172,4 +186,17 @@ func (c *Client) do(ctx context.Context, query string, vars map[string]any, out 
 		return fmt.Errorf("decode tibber gql data: %w", err)
 	}
 	return nil
+}
+
+// isAuthFailure matches the two shapes Tibber returns when a JWT is dead:
+// a HTTP 401, or a HTTP 200 with a GraphQL error message containing
+// "Not authenticated" / "UNAUTHENTICATED".
+func isAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "returned 401") ||
+		strings.Contains(msg, "Not authenticated") ||
+		strings.Contains(msg, "UNAUTHENTICATED")
 }
