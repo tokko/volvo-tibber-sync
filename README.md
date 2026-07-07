@@ -176,6 +176,56 @@ already taken on your host.
 
 ---
 
+## Nightly auto-lock (optional)
+
+The monitor can lock the car every evening if it was left unlocked. Set
+`LOCK_SCHEDULE=20:00` in `.env` (24-hour `HH:MM`; blank disables it) and the
+monitor, at that time each day, reads the door/lock state and — if the car is
+**unlocked and all doors are closed** — sends a lock command. If the car is
+asleep it retries up to 3 times, ~2 minutes apart.
+
+> ⚠️ **This is an unattended physical actuator — accept the failure modes before
+> enabling it.** At the scheduled time the car may lock while someone is loading
+> it or with a person/pet **inside**. The only situational awareness it has is
+> the door-open guard: if any door is open, it skips locking. If door state
+> can't be read at all, it also skips (it never locks blind). It requests only
+> the lock permission, **never unlock**. Use `LOCK_SCHEDULE` only if that's
+> acceptable for your household.
+
+**Prerequisites** (the feature is inert without both):
+
+1. **Add the Connected Vehicle API** to your app on
+   [developer.volvocars.com](https://developer.volvocars.com) — it's a separate
+   product from the Energy API this project uses by default. Command scopes may
+   require the app to be published, not draft.
+2. **Re-authorize with the lock scopes, container stopped.** OAuth scopes are
+   fixed at authorization time, so the existing token can't lock the car. Run,
+   **in this order** (running `oauth` while the monitor is live races the shared
+   `token.json` and can lock you out into an `invalid_grant` loop):
+   ```bash
+   cd ~/volvo-tibber-sync
+   docker compose down
+   ./oauth --scopes "openid energy:state:read conve:lock_status conve:lock"
+   docker compose up -d
+   ```
+
+**Timezone.** `LOCK_SCHEDULE` is interpreted in `LOCK_TZ` (default
+`Europe/Stockholm`), DST-aware. An invalid `LOCK_TZ` **disables** the feature
+rather than silently firing in UTC — check the startup log line
+(`nightly auto-lock enabled … tz=…`) to confirm.
+
+**Test it without waiting for 20:00:**
+```bash
+docker compose run --rm monitor --lock-now --dry-run   # read state, log intended action, send nothing
+docker compose run --rm monitor --lock-now             # actually lock, if unlocked
+```
+
+**Known limitation.** If the container is restarted across the scheduled time,
+that night is skipped — there's no catch-up. The lock only fires when the
+process is running at exactly `HH:MM`.
+
+---
+
 ## Configuration reference
 
 All configuration lives in `.env` (created from `.env.example` by the
@@ -197,6 +247,9 @@ installer).
 | `TOKEN_STORE_PATH` | no | `/data/token.json` | Where Volvo token is persisted |
 | `TIBBER_TOKEN_STORE_PATH` | no | `/data/tibber-token.json` | Where Tibber JWT is persisted |
 | `HTTP_ADDR` | no | `:8080` | HTTP listen address inside the container (leave empty to disable) |
+| `LOCK_SCHEDULE` | no | — | Daily `HH:MM` to lock the car if unlocked; blank disables (see [Nightly auto-lock](#nightly-auto-lock-optional)) |
+| `LOCK_TZ` | no | `Europe/Stockholm` | Timezone for `LOCK_SCHEDULE`; invalid value disables the feature |
+| `TZ` | no | — | Log-timestamp timezone (readability only) |
 
 Tokens are persisted to `./data/` on the host (bind-mounted into the
 container at `/data`) so restarts don't require re-authentication. Volvo
@@ -232,6 +285,13 @@ monitor never has to fall back to the env bootstrap on a healthy setup. The
 monitor logs at `ERROR` level when it sees `invalid_grant` so the condition
 is visible in `curl http://<host>:8082/logs`.
 
+**Auto-lock logs `re-auth required` / `not allowed to access` (403)** — the
+token isn't authorized for the Connected Vehicle API. Either the app isn't
+subscribed to that product, or you haven't re-authorized with the lock scopes.
+Follow the [Nightly auto-lock](#nightly-auto-lock-optional) prerequisites. (A
+403 that mentions *quota* instead is transient — the daily call budget was hit;
+it is logged at `WARN`, not treated as a re-auth condition.)
+
 **`VEHICLE_NOT_FOUND` from Volvo API** — the VIN in `.env` doesn't match
 any vehicle on your Volvo account. Double-check `VOLVO_VIN` character by
 character against the Volvo Cars app (car → Details). Common mistake: `O`
@@ -253,7 +313,9 @@ go run ./cmd/monitor --once --dry-run
 ```
 
 `--once` exits after one poll. `--dry-run` logs the intended Tibber push
-without sending it.
+without sending it. `--lock-now` runs a single lock-check cycle (locking the
+car if unlocked) and exits without polling or pushing to Tibber; combine with
+`--dry-run` to read state without sending a lock command.
 
 ### Build locally
 

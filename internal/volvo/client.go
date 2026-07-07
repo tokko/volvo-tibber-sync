@@ -1,11 +1,15 @@
 package volvo
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,6 +20,11 @@ type Client struct {
 	tokens *TokenSource
 	apiKey string
 	vin    string
+
+	// logDoorsOnce logs the raw /doors payload the first time it's fetched, so
+	// the operator can confirm the field names (centralLock vs carLocked, the
+	// door keys) on a real vehicle without turning it into per-call log noise.
+	logDoorsOnce sync.Once
 }
 
 func NewClient(ts *TokenSource, apiKey, vin string) *Client {
@@ -58,11 +67,11 @@ type resourceString struct {
 }
 
 type energyStateResp struct {
-	BatteryChargeLevel                          resourceFloat  `json:"batteryChargeLevel"`
-	ElectricRange                               resourceInt    `json:"electricRange"`
-	EstimatedChargingTimeToTargetBatteryCharge  resourceInt    `json:"estimatedChargingTimeToTargetBatteryChargeLevel"`
-	ChargingStatus                              resourceString `json:"chargingStatus"`
-	ChargerConnectionStatus                     resourceString `json:"chargerConnectionStatus"`
+	BatteryChargeLevel                         resourceFloat  `json:"batteryChargeLevel"`
+	ElectricRange                              resourceInt    `json:"electricRange"`
+	EstimatedChargingTimeToTargetBatteryCharge resourceInt    `json:"estimatedChargingTimeToTargetBatteryChargeLevel"`
+	ChargingStatus                             resourceString `json:"chargingStatus"`
+	ChargerConnectionStatus                    resourceString `json:"chargerConnectionStatus"`
 }
 
 func (c *Client) FetchChargeState(ctx context.Context) ChargeState {
@@ -122,6 +131,151 @@ func (c *Client) FetchChargeState(ctx context.Context) ChargeState {
 	}
 
 	return state
+}
+
+// LockStatus is the flattened door/lock snapshot from the Connected Vehicle API.
+type LockStatus struct {
+	CentralLock string    // normalized upper: "LOCKED"/"UNLOCKED"/"" if absent
+	AnyDoorOpen bool      // any non-lock part reported OPEN
+	OpenParts   []string  // names of the parts reporting OPEN (for first-run inspection)
+	DoorsKnown  bool      // true only if >=1 door part decoded — the guard is trustworthy
+	ObservedAt  time.Time // centralLock timestamp, for staleness visibility
+	Errors      []string  // HTTP-layer failures; carries the raw body for 403 classification
+}
+
+// LockResult is the outcome of a lock command.
+type LockResult struct {
+	InvokeStatus string // "COMPLETED" on success; "" if the request failed before decode
+	Message      string
+	Errors       []string
+}
+
+// connField mirrors a Connected Vehicle API value object: {value, timestamp}.
+type connField struct {
+	Value     string    `json:"value"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// doorsResp decodes the /doors envelope. Unlike the Energy endpoint, Connected
+// Vehicle wraps its resources in "data". We decode into a map so we don't have
+// to hard-code every door key (which varies by model) — the lock field is
+// centralLock (older models: carLocked); every other key is a door/hatch/lid.
+type doorsResp struct {
+	Data map[string]connField `json:"data"`
+}
+
+type lockResp struct {
+	Data struct {
+		InvokeStatus string `json:"invokeStatus"`
+		Message      string `json:"message"`
+	} `json:"data"`
+}
+
+// FetchLockStatus reads central-lock and per-door open/closed state.
+func (c *Client) FetchLockStatus(ctx context.Context) LockStatus {
+	st := LockStatus{}
+
+	u := fmt.Sprintf("%s/connected-vehicle/v2/vehicles/%s/doors", APIBase, c.vin)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		st.Errors = append(st.Errors, fmt.Sprintf("build request: %v", err))
+		return st
+	}
+	tok, err := c.tokens.Access(ctx)
+	if err != nil {
+		st.Errors = append(st.Errors, fmt.Sprintf("get token: %v", err))
+		return st
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("vcc-api-key", c.apiKey)
+	req.Header.Set("accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		st.Errors = append(st.Errors, fmt.Sprintf("request: %v", err))
+		return st
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+
+	if resp.StatusCode != http.StatusOK {
+		st.Errors = append(st.Errors, fmt.Sprintf("status %d: %s", resp.StatusCode, truncate(string(body), 400)))
+		return st
+	}
+
+	c.logDoorsOnce.Do(func() {
+		slog.Info("connected-vehicle /doors raw payload (first fetch — confirm field names)", "body", truncate(string(body), 800))
+	})
+
+	var dr doorsResp
+	if err := json.Unmarshal(body, &dr); err != nil {
+		st.Errors = append(st.Errors, fmt.Sprintf("decode: %v (body: %s)", err, truncate(string(body), 400)))
+		return st
+	}
+
+	for key, f := range dr.Data {
+		val := strings.ToUpper(strings.TrimSpace(f.Value))
+		switch key {
+		case "centralLock", "carLocked":
+			st.CentralLock = val
+			st.ObservedAt = f.Timestamp
+		default:
+			// Any other key is a physical part (door/hood/tailgate/tankLid).
+			st.DoorsKnown = true
+			if val == "OPEN" {
+				st.AnyDoorOpen = true
+				st.OpenParts = append(st.OpenParts, key)
+			}
+		}
+	}
+
+	return st
+}
+
+// Lock sends the central-lock command. The command is asynchronous: a non-error
+// result carries an invokeStatus ("COMPLETED" means the car confirmed the lock).
+func (c *Client) Lock(ctx context.Context) LockResult {
+	res := LockResult{}
+
+	u := fmt.Sprintf("%s/connected-vehicle/v2/vehicles/%s/commands/lock", APIBase, c.vin)
+	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		res.Errors = append(res.Errors, fmt.Sprintf("build request: %v", err))
+		return res
+	}
+	tok, err := c.tokens.Access(ctx)
+	if err != nil {
+		res.Errors = append(res.Errors, fmt.Sprintf("get token: %v", err))
+		return res
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("vcc-api-key", c.apiKey)
+	req.Header.Set("accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		res.Errors = append(res.Errors, fmt.Sprintf("request: %v", err))
+		return res
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+
+	// The command endpoint answers 200 (sync) or 202 (accepted); both carry an
+	// invokeStatus body. Anything else is an HTTP-layer failure.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		res.Errors = append(res.Errors, fmt.Sprintf("status %d: %s", resp.StatusCode, truncate(string(body), 400)))
+		return res
+	}
+
+	var lr lockResp
+	if err := json.Unmarshal(body, &lr); err != nil {
+		res.Errors = append(res.Errors, fmt.Sprintf("decode: %v (body: %s)", err, truncate(string(body), 400)))
+		return res
+	}
+	res.InvokeStatus = lr.Data.InvokeStatus
+	res.Message = lr.Data.Message
+	return res
 }
 
 func truncate(s string, n int) string {

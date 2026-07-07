@@ -23,6 +23,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	_ "time/tzdata" // embed zoneinfo so LoadLocation works in distroless (no OS tzdata)
 
 	"github.com/tokko/volvo-tibber-sync/internal/config"
 	"github.com/tokko/volvo-tibber-sync/internal/tibber"
@@ -31,7 +32,8 @@ import (
 
 var (
 	flagOnce    = flag.Bool("once", false, "run one poll cycle and exit (useful for testing or cron)")
-	flagDryRun  = flag.Bool("dry-run", false, "fetch Volvo state and log the intended Tibber push, but do not call Tibber")
+	flagDryRun  = flag.Bool("dry-run", false, "fetch Volvo state and log the intended action, but do not call Tibber or send a lock command")
+	flagLockNow = flag.Bool("lock-now", false, "run one lock-check cycle (lock the car if unlocked) and exit; does not poll or push to Tibber")
 )
 
 // logRing is a global capped ring buffer of emitted log lines, so the /logs
@@ -123,6 +125,7 @@ func run() error {
 		"token_store", tokenStore,
 		"tibber_enabled", tbrClient != nil,
 		"once", *flagOnce,
+		"lock_now", *flagLockNow,
 		"dry_run", *flagDryRun,
 	)
 
@@ -145,11 +148,19 @@ func run() error {
 		pushToTibber(pCtx, tbrClient, tbrConf, state)
 	}
 
+	if *flagLockNow {
+		lockCheckOnce(ctx, client, *flagDryRun)
+		slog.Info("--lock-now: exiting after single lock check")
+		return nil
+	}
+
 	pollOnce()
 	if *flagOnce {
 		slog.Info("--once: exiting after single poll")
 		return nil
 	}
+
+	startLockScheduler(ctx, client)
 
 	t := time.NewTicker(pollInterval)
 	defer t.Stop()
@@ -218,6 +229,175 @@ func anyInvalidGrant(errs []string) bool {
 		}
 	}
 	return false
+}
+
+// anyForbiddenScope reports whether an error is Volvo's "not allowed to access
+// the API" 403 — a scope/subscription problem that needs re-auth. It must NOT
+// match the *other* 403 Volvo returns ("out of call volume quota"), which is
+// transient and must not trigger a re-auth prompt.
+func anyForbiddenScope(errs []string) bool {
+	for _, e := range errs {
+		if strings.Contains(e, "403") && strings.Contains(strings.ToLower(e), "not allowed to access") {
+			return true
+		}
+	}
+	return false
+}
+
+// startLockScheduler launches the nightly auto-lock goroutine if LOCK_SCHEDULE
+// is set. Timezone is resolved explicitly and fail-closed: an invalid LOCK_TZ
+// disables the feature rather than silently firing in UTC.
+func startLockScheduler(ctx context.Context, client *volvo.Client) {
+	schedule := config.Optional("LOCK_SCHEDULE", "")
+	if schedule == "" {
+		slog.Info("nightly auto-lock disabled (set LOCK_SCHEDULE=20:00 to enable)")
+		return
+	}
+	at, err := time.Parse("15:04", schedule)
+	if err != nil {
+		slog.Error("invalid LOCK_SCHEDULE (want HH:MM) — nightly auto-lock disabled", "value", schedule, "err", err)
+		return
+	}
+	tzName := config.Optional("LOCK_TZ", "Europe/Stockholm")
+	loc, err := time.LoadLocation(tzName)
+	if err != nil {
+		slog.Error("invalid LOCK_TZ — nightly auto-lock disabled (refusing to fall back to UTC)", "value", tzName, "err", err)
+		return
+	}
+	slog.Info("nightly auto-lock enabled", "at", schedule, "tz", tzName, "scopes", volvo.LockScopes)
+	go runLockScheduler(ctx, client, at.Hour(), at.Minute(), loc)
+}
+
+// nextOccurrence returns the next wall-clock HH:MM in loc strictly after now.
+// Computing in loc each time (never now.Add(24h)) keeps it DST-correct.
+func nextOccurrence(now time.Time, hour, min int, loc *time.Location) time.Time {
+	n := now.In(loc)
+	next := time.Date(n.Year(), n.Month(), n.Day(), hour, min, 0, 0, loc)
+	if !next.After(n) {
+		next = next.AddDate(0, 0, 1)
+	}
+	return next
+}
+
+func runLockScheduler(ctx context.Context, client *volvo.Client, hour, min int, loc *time.Location) {
+	for {
+		next := nextOccurrence(time.Now(), hour, min, loc)
+		slog.Info("next lock check scheduled", "at", next.Format(time.RFC3339))
+		timer := time.NewTimer(time.Until(next))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			lockCheckOnce(ctx, client, *flagDryRun)
+		}
+	}
+}
+
+// lockCheckOnce runs one lock-check cycle: read lock/door state and, if the car
+// is unlocked and safe to lock, send the lock command. It retries only the
+// asleep/timeout case (a garaged car is often asleep at the scheduled hour);
+// every other outcome returns immediately. Log-and-continue throughout.
+func lockCheckOnce(ctx context.Context, client *volvo.Client, dryRun bool) {
+	const maxAttempts = 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if lockCheckAttempt(ctx, client, dryRun, attempt) {
+			return
+		}
+		if attempt < maxAttempts {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Minute):
+			}
+		}
+	}
+	slog.Error("could not lock car — gave up after retries (car may be unreachable)", "attempts", maxAttempts)
+}
+
+// lockCheckAttempt runs a single attempt. It returns true when the cycle is
+// done (success, or a terminal condition that must not be retried) and false
+// only for the asleep/timeout case that warrants a retry.
+func lockCheckAttempt(ctx context.Context, client *volvo.Client, dryRun bool, attempt int) bool {
+	aCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	st := client.FetchLockStatus(aCtx)
+	if len(st.Errors) > 0 {
+		logLockError("read lock status failed", st.Errors, attempt)
+		return true // never retry HTTP / scope / quota failures
+	}
+	if !st.DoorsKnown {
+		slog.Warn("no door data — cannot verify it is safe to lock; skipping", lockAttrs(st, attempt)...)
+		return true
+	}
+	if st.AnyDoorOpen {
+		slog.Info("car in use (a door is open); skipping lock", lockAttrs(st, attempt)...)
+		return true
+	}
+	switch st.CentralLock {
+	case "LOCKED":
+		slog.Info("car already locked; nothing to do", lockAttrs(st, attempt)...)
+		return true
+	case "UNLOCKED":
+		// proceed to lock
+	default:
+		slog.Warn("unknown lock state — check scopes/model; not locking", lockAttrs(st, attempt)...)
+		return true
+	}
+
+	if dryRun {
+		slog.Info("car is unlocked — would send lock command (dry-run, NOT sent)", lockAttrs(st, attempt)...)
+		return true
+	}
+
+	res := client.Lock(aCtx)
+	if len(res.Errors) > 0 {
+		logLockError("lock command failed", res.Errors, attempt)
+		return true // HTTP failure — don't retry
+	}
+	switch strings.ToUpper(res.InvokeStatus) {
+	case "COMPLETED":
+		slog.Info("car locked", "attempt", attempt, "invoke_status", res.InvokeStatus, "message", res.Message)
+		return true
+	case "RUNNING", "DELIVERED", "WAITING":
+		slog.Info("lock command accepted; completing asynchronously", "attempt", attempt, "invoke_status", res.InvokeStatus, "message", res.Message)
+		return true
+	default:
+		// TIMEOUT / VEHICLE_IN_SLEEP / etc. — the car is likely asleep; retry.
+		slog.Warn("lock not confirmed; will retry if attempts remain", "attempt", attempt, "invoke_status", res.InvokeStatus, "message", res.Message)
+		return false
+	}
+}
+
+func lockAttrs(st volvo.LockStatus, attempt int) []any {
+	attrs := []any{
+		"attempt", attempt,
+		"central_lock", st.CentralLock,
+		"any_door_open", st.AnyDoorOpen,
+	}
+	if len(st.OpenParts) > 0 {
+		attrs = append(attrs, "open_parts", st.OpenParts)
+	}
+	if !st.ObservedAt.IsZero() {
+		attrs = append(attrs, "observed_at", st.ObservedAt.Format(time.RFC3339))
+	}
+	return attrs
+}
+
+func logLockError(msg string, errs []string, attempt int) {
+	attrs := []any{"attempt", attempt, "errors", errs}
+	switch {
+	case anyForbiddenScope(errs):
+		attrs = append(attrs, "action_required", "re-run ./oauth with lock scopes (openid energy:state:read conve:lock_status conve:lock) and restart — the token is not authorized for the Connected Vehicle API")
+		slog.Error(msg+" — re-auth required", attrs...)
+	case anyInvalidGrant(errs):
+		attrs = append(attrs, "action_required", "run ./oauth on the host and restart the container (refresh token was rejected by Volvo)")
+		slog.Error(msg+" — re-auth required", attrs...)
+	default:
+		// Includes quota-403 and transient network/5xx — do not prompt re-auth.
+		slog.Warn(msg, attrs...)
+	}
 }
 
 func loadStoredToken(path string) (volvo.Token, bool) {

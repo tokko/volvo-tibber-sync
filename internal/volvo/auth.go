@@ -24,6 +24,20 @@ var DefaultScopes = []string{
 	"energy:state:read",
 }
 
+// LockScopes are the additional Connected Vehicle API scopes required for the
+// nightly auto-lock feature: lock_status reads central-lock + per-door state
+// (the safety guard), lock sends the command. To enable locking, re-authorize
+// with both DefaultScopes and LockScopes:
+//
+//	oauth --scopes "openid energy:state:read conve:lock_status conve:lock"
+//
+// We intentionally never request conve:unlock — a leaked token can lock the car
+// but not open it.
+var LockScopes = []string{
+	"conve:lock_status",
+	"conve:lock",
+}
+
 type Token struct {
 	AccessToken  string    `json:"access_token"`
 	RefreshToken string    `json:"refresh_token"`
