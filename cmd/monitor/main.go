@@ -16,6 +16,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -32,7 +33,7 @@ import (
 
 var (
 	flagOnce    = flag.Bool("once", false, "run one poll cycle and exit (useful for testing or cron)")
-	flagDryRun  = flag.Bool("dry-run", false, "fetch Volvo state and log the intended action, but do not call Tibber or send a lock command")
+	flagDryRun  = flag.Bool("dry-run", false, "fetch state and log intended actions; do not mutate Tibber or send a lock command")
 	flagLockNow = flag.Bool("lock-now", false, "run one lock-check cycle (lock the car if unlocked) and exit; does not poll or push to Tibber")
 )
 
@@ -143,9 +144,12 @@ func run() error {
 		}
 		if *flagDryRun {
 			logDryRunPush(tbrConf, state)
-			return
+		} else {
+			pushToTibber(pCtx, tbrClient, tbrConf, state)
 		}
-		pushToTibber(pCtx, tbrClient, tbrConf, state)
+		if tbrConf.chargerID != "" {
+			reconcileTibberChargerCar(pCtx, tbrClient, tbrConf, tbrConf.preferredVehicleName, *flagDryRun)
+		}
 	}
 
 	if *flagLockNow {
@@ -446,9 +450,13 @@ type latestState struct {
 }
 
 type tibberConfig struct {
-	homeID      string
-	vehicleID   string
-	vehicleName string
+	homeID               string
+	vehicleID            string
+	vehicleName          string
+	chargerName          string
+	chargerID            string
+	preferredVehicleName string
+	chargerVehicles      map[string]string
 }
 
 // buildTibberClient returns a configured client or (nil, _) if Tibber is not
@@ -460,6 +468,36 @@ func buildTibberClient(tokenStorePath string) (*tibber.Client, tibberConfig) {
 	homeID := config.Optional("TIBBER_HOME_ID", "")
 	vehicleID := config.Optional("TIBBER_VEHICLE_ID", "")
 	vehicleName := config.Optional("TIBBER_VEHICLE_NAME", "")
+	chargerName := config.Optional("TIBBER_CHARGER_NAME", "")
+	chargerID := config.Optional("TIBBER_CHARGER_ID", "")
+	preferredVehicleName := config.Optional("TIBBER_PREFERRED_VEHICLE_NAME", "")
+	chargerVehicles := map[string]string{}
+	vehicleMapValue := config.Optional("TIBBER_CHARGER_VEHICLES", "")
+	if vehicleMapValue != "" {
+		values, err := url.ParseQuery(vehicleMapValue)
+		if err != nil {
+			slog.Warn("tibber charger vehicle map is malformed; selection is disabled")
+			chargerVehicles = nil
+		} else {
+			for name, ids := range values {
+				if len(ids) != 1 {
+					slog.Warn("tibber charger vehicle map has a duplicate name; selection is disabled", "name", name)
+					chargerVehicles = nil
+					break
+				}
+				chargerVehicles[name] = ids[0]
+			}
+		}
+		seenIDs := make(map[string]bool, len(chargerVehicles))
+		for name, id := range chargerVehicles {
+			if strings.TrimSpace(name) == "" || strings.TrimSpace(id) == "" || seenIDs[id] {
+				slog.Warn("tibber charger vehicle map has a missing or duplicate name/ID; selection is disabled")
+				chargerVehicles = nil
+				break
+			}
+			seenIDs[id] = true
+		}
+	}
 
 	if email == "" && password == "" && homeID == "" && vehicleID == "" {
 		return nil, tibberConfig{}
@@ -468,6 +506,19 @@ func buildTibberClient(tokenStorePath string) (*tibber.Client, tibberConfig) {
 		slog.Warn("tibber partially configured; skipping push — need TIBBER_EMAIL, TIBBER_PASSWORD, TIBBER_HOME_ID, TIBBER_VEHICLE_ID")
 		return nil, tibberConfig{}
 	}
+	if chargerName != "" || chargerID != "" || preferredVehicleName != "" || len(chargerVehicles) > 0 {
+		if chargerName == "" || chargerID == "" || preferredVehicleName == "" || len(chargerVehicles) == 0 {
+			slog.Warn("tibber charger selection is partially configured; selection is disabled")
+			chargerName, chargerID, preferredVehicleName, chargerVehicles = "", "", "", nil
+		} else if _, ok := chargerVehicles[preferredVehicleName]; !ok {
+			slog.Warn("tibber preferred car has no configured name/ID mapping; selection is disabled", "name", preferredVehicleName)
+			chargerName, chargerID, preferredVehicleName, chargerVehicles = "", "", "", nil
+		}
+	}
+	return buildTibberClientWithConfig(tokenStorePath, email, password, homeID, vehicleID, vehicleName, chargerName, chargerID, preferredVehicleName, chargerVehicles)
+}
+
+func buildTibberClientWithConfig(tokenStorePath, email, password, homeID, vehicleID, vehicleName, chargerName, chargerID, preferredVehicleName string, chargerVehicles map[string]string) (*tibber.Client, tibberConfig) {
 
 	sess := tibber.NewSession(email, password)
 	if stored, ok := loadTibberToken(tokenStorePath); ok {
@@ -482,10 +533,192 @@ func buildTibberClient(tokenStorePath string) (*tibber.Client, tibberConfig) {
 	})
 
 	return tibber.NewClient(sess), tibberConfig{
-		homeID:      homeID,
-		vehicleID:   vehicleID,
-		vehicleName: vehicleName,
+		homeID:               homeID,
+		vehicleID:            vehicleID,
+		vehicleName:          vehicleName,
+		chargerName:          chargerName,
+		chargerID:            chargerID,
+		preferredVehicleName: preferredVehicleName,
+		chargerVehicles:      chargerVehicles,
 	}
+}
+
+func reconcileTibberChargerCar(ctx context.Context, c *tibber.Client, cfg tibberConfig, targetName string, dryRun bool) {
+	targetID, ok := cfg.chargerVehicles[targetName]
+	if !ok || targetName == "" {
+		slog.Error("tibber charger selection skipped; target has no configured name/ID mapping", "vehicle", targetName)
+		return
+	}
+
+	const maxAttempts = 2
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		charger, err := readConfiguredCharger(ctx, c, cfg)
+		if err != nil {
+			slog.Error("tibber charger selection read failed", "err", err, "attempt", attempt)
+			return
+		}
+		target, err := validateTargetVehicle(charger, targetName, targetID)
+		if err != nil {
+			slog.Error("tibber charger selection skipped", "err", err)
+			return
+		}
+		aligned, err := chargerSelectionAligned(charger, target.ID)
+		if err != nil {
+			slog.Error("tibber charger selection skipped", "err", err)
+			return
+		}
+		if aligned {
+			slog.Info("tibber charger car already selected", "charger", cfg.chargerName, "vehicle", targetName, "vehicle_id", targetID)
+			return
+		}
+		if dryRun {
+			slog.Info("tibber charger selection (dry-run — NOT sent)", "charger", cfg.chargerName, "charger_id", cfg.chargerID, "vehicle", targetName, "vehicle_id", targetID, "saved_vehicle_id", charger.PreferredVehicleID)
+			return
+		}
+
+		if charger.PreferredVehicleID != target.ID {
+			if err := c.SetPreferredVehicleID(ctx, cfg.homeID, cfg.chargerID, target.ID); err != nil {
+				slog.Warn("tibber saved charger preference request failed; reading actual state before recovery", "err", err, "attempt", attempt)
+			}
+			charger, err = readConfiguredCharger(ctx, c, cfg)
+			if err != nil {
+				slog.Error("tibber charger selection readback failed", "err", err, "attempt", attempt)
+				return
+			}
+			if _, err := validateTargetVehicle(charger, targetName, targetID); err != nil {
+				slog.Error("tibber charger selection stopped after saved preference request", "err", err)
+				return
+			}
+			if charger.PreferredVehicleID != target.ID {
+				slog.Warn("tibber saved charger preference did not take effect", "wanted_vehicle_id", target.ID, "saved_vehicle_id", charger.PreferredVehicleID, "attempt", attempt)
+				continue
+			}
+		}
+
+		aligned, err = chargerSelectionAligned(charger, target.ID)
+		if err != nil {
+			slog.Error("tibber charger selection skipped", "err", err)
+			return
+		}
+		if !aligned {
+			if err := c.SelectPreferredVehicle(ctx, cfg.homeID, cfg.chargerID, target.ID); err != nil {
+				slog.Warn("tibber current charger selection request failed; reading actual state before recovery", "err", err, "attempt", attempt)
+			}
+		}
+
+		for read := 0; read < 7; read++ {
+			if read > 0 {
+				select {
+				case <-ctx.Done():
+					slog.Warn("tibber charger selection readback timed out", "vehicle", targetName, "attempt", attempt)
+					return
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+			charger, err = readConfiguredCharger(ctx, c, cfg)
+			if err != nil {
+				slog.Error("tibber charger selection readback failed", "err", err, "attempt", attempt)
+				return
+			}
+			if _, err := validateTargetVehicle(charger, targetName, targetID); err != nil {
+				slog.Error("tibber charger selection stopped during readback", "err", err)
+				return
+			}
+			aligned, err = chargerSelectionAligned(charger, target.ID)
+			if err != nil {
+				slog.Error("tibber charger selection skipped", "err", err)
+				return
+			}
+			if aligned {
+				slog.Info("tibber charger car selection confirmed", "charger", cfg.chargerName, "vehicle", targetName, "vehicle_id", targetID)
+				return
+			}
+		}
+		slog.Warn("tibber charger selection remains mismatched; will reconcile on the next observation", "charger", cfg.chargerName, "vehicle", targetName, "vehicle_id", targetID, "attempt", attempt)
+	}
+}
+
+func readConfiguredCharger(ctx context.Context, c *tibber.Client, cfg tibberConfig) (tibber.Charger, error) {
+	gizmos, err := c.ListHomeGizmos(ctx, cfg.homeID)
+	if err != nil {
+		return tibber.Charger{}, fmt.Errorf("list configured home gizmos: %w", err)
+	}
+	chargerMatches := 0
+	for _, g := range gizmos {
+		if g.Type == "EV_CHARGER" && (g.ID == cfg.chargerID || g.Name == cfg.chargerName) {
+			chargerMatches++
+			if g.ID != cfg.chargerID || g.Name != cfg.chargerName {
+				return tibber.Charger{}, fmt.Errorf("configured charger name and ID do not match one EV_CHARGER in home %q", cfg.homeID)
+			}
+		}
+	}
+	if chargerMatches != 1 {
+		return tibber.Charger{}, fmt.Errorf("configured charger %q (%s) matched %d EV_CHARGER gizmos in home %q", cfg.chargerName, cfg.chargerID, chargerMatches, cfg.homeID)
+	}
+	charger, err := c.GetCharger(ctx, cfg.homeID, cfg.chargerID)
+	if err != nil {
+		return tibber.Charger{}, fmt.Errorf("read configured charger: %w", err)
+	}
+	if charger.ID != cfg.chargerID || charger.Name != cfg.chargerName || charger.Type != "EV_CHARGER" {
+		return tibber.Charger{}, fmt.Errorf("charger response does not match configured EV_CHARGER %q (%s)", cfg.chargerName, cfg.chargerID)
+	}
+	if err := validateConfiguredChargerVehicles(charger, cfg.chargerVehicles); err != nil {
+		return tibber.Charger{}, err
+	}
+	return charger, nil
+}
+
+func validateTargetVehicle(charger tibber.Charger, name, id string) (tibber.ChargerVehicle, error) {
+	nameMatches, idMatches := 0, 0
+	var target tibber.ChargerVehicle
+	for _, vehicle := range charger.Vehicles {
+		if vehicle.Name == name {
+			nameMatches++
+			target = vehicle
+		}
+		if vehicle.ID == id {
+			idMatches++
+		}
+	}
+	if nameMatches != 1 || idMatches != 1 || target.ID != id {
+		return tibber.ChargerVehicle{}, fmt.Errorf("configured car name and ID do not uniquely match a vehicle on charger %q", charger.Name)
+	}
+	return target, nil
+}
+
+func validateConfiguredChargerVehicles(charger tibber.Charger, configured map[string]string) error {
+	if len(configured) == 0 {
+		return fmt.Errorf("no configured charger car mappings")
+	}
+	seenIDs := make(map[string]bool, len(configured))
+	for name, id := range configured {
+		if strings.TrimSpace(name) == "" || strings.TrimSpace(id) == "" || seenIDs[id] {
+			return fmt.Errorf("configured charger car mappings contain a missing or duplicate name/ID")
+		}
+		seenIDs[id] = true
+		if _, err := validateTargetVehicle(charger, name, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func chargerSelectionAligned(charger tibber.Charger, targetID string) (bool, error) {
+	preferred := 0
+	targetPreferred := false
+	for _, vehicle := range charger.Vehicles {
+		if vehicle.ID == "" || vehicle.Name == "" || vehicle.IsPreferred == nil {
+			return false, fmt.Errorf("charger returned a vehicle with missing ID, name, or preference status")
+		}
+		if *vehicle.IsPreferred {
+			preferred++
+			targetPreferred = vehicle.ID == targetID
+		}
+	}
+	if preferred > 1 {
+		return false, fmt.Errorf("charger returned multiple currently preferred vehicles")
+	}
+	return charger.PreferredVehicleID == targetID && targetPreferred, nil
 }
 
 func pushToTibber(ctx context.Context, c *tibber.Client, cfg tibberConfig, s volvo.ChargeState) {

@@ -122,7 +122,10 @@ curl -fsSL .../install.sh | RELEASE_TAG=v0.2.0 bash
 
 4. **Tibber vehicle discovery** — runs `tibber-discover` to list homes and
    vehicles on your account. You can supply a substring to auto-select your
-   mock car (e.g. `Ragnar`), or pick interactively.
+   mock car (e.g. `Ragnar`), or pick interactively. It then lists the selected
+   home's `EV_CHARGER` gizmos and each charger's named cars. Pick the charger
+   and preferred car by display name; the selected IDs and all linked car
+   name-to-ID pairs are saved privately in `.env`.
 
 5. **Start** — offers to run `docker compose up -d`.
 
@@ -243,6 +246,10 @@ installer).
 | `TIBBER_HOME_ID` | no | — | Written by `tibber-discover` |
 | `TIBBER_VEHICLE_ID` | no | — | Written by `tibber-discover` |
 | `TIBBER_VEHICLE_NAME` | no | — | Display name; used in log output only |
+| `TIBBER_CHARGER_NAME` | no | — | Selected charger display name from `tibber-discover` |
+| `TIBBER_CHARGER_ID` | no | — | ID of that `EV_CHARGER` in `TIBBER_HOME_ID` |
+| `TIBBER_CHARGER_VEHICLES` | no | — | URL-encoded name-to-ID pairs of cars linked to that charger; written by `tibber-discover` |
+| `TIBBER_PREFERRED_VEHICLE_NAME` | no | — | Named charger car to select; must match one mapped car exactly |
 | `POLL_INTERVAL` | no | `3h` | How often to read charge state |
 | `TOKEN_STORE_PATH` | no | `/data/token.json` | Where Volvo token is persisted |
 | `TIBBER_TOKEN_STORE_PATH` | no | `/data/tibber-token.json` | Where Tibber JWT is persisted |
@@ -260,6 +267,23 @@ monitor never has to fall back to the one-shot `VOLVO_REFRESH_TOKEN` from
 
 If Tibber is not configured (all `TIBBER_*` vars blank) the monitor still runs
 and logs Volvo charge state — the Tibber push is simply skipped.
+
+The charger selection uses the configured home's `EV_CHARGER` gizmo and its
+`vehicles { id name }` list. Before changing selection, the monitor verifies
+that charger and the target car still match their configured name/ID pairs.
+It reads both the saved `userSettings.preferredVehicleId` and the current
+vehicle's `isPreferred` flag. If either differs, it sends one
+`setVehicleChargerSettings` request with the `preferredVehicleId` key, then a
+separate subsequent request with the `selectPreferredVehicle` key. It confirms
+both fields with a fresh read.
+If Tibber has not propagated the selection yet, the monitor waits briefly,
+then performs one bounded recovery after reading actual state. A remaining
+mismatch is logged for the next poll. `--dry-run` still reads the charger and
+reports the intended selection, while suppressing Tibber mutations.
+
+The charger car mapping does not change the battery-sync vehicle. Keep
+`TIBBER_VEHICLE_ID` set to Ragnar's mock car so Volvo battery updates continue
+to target Ragnar even when the charger selects another car.
 
 ---
 
@@ -312,8 +336,9 @@ errors.
 go run ./cmd/monitor --once --dry-run
 ```
 
-`--once` exits after one poll. `--dry-run` logs the intended Tibber push
-without sending it. `--lock-now` runs a single lock-check cycle (locking the
+`--once` exits after one poll. `--dry-run` logs the intended Tibber push and
+charger selection without sending mutations; it reads Tibber state to report
+the current selection. `--lock-now` runs a single lock-check cycle (locking the
 car if unlocked) and exits without polling or pushing to Tibber; combine with
 `--dry-run` to read state without sending a lock command.
 
