@@ -569,7 +569,7 @@ func runPhonePresenceSchedule(ctx context.Context, cfg *phonePresenceConfig, dry
 			slog.Warn("phone presence observation unknown; enrolled MAC matched multiple router records", "observed_at", observedAt.Format(time.RFC3339), "next_check", nextCheck.In(loc).Format(time.RFC3339))
 			continue
 		}
-		daytime := phonePresenceDaytime(observedAt)
+		daytime := phonePresenceDaytime(next.In(loc))
 		if !daytime && !state.PendingDeparture {
 			continue
 		}
