@@ -75,6 +75,53 @@ pick any generic model) and let this service keep its battery level in sync.
 You'll need your Tibber **email** and **password** (same credentials as the
 Tibber mobile app).
 
+### Optional Deco phone presence
+
+The monitor can select **pappas bil** while Björn's iPhone is connected to the
+home Deco mesh and **Ragnar** after it is absent. This feature is opt-in and
+requires both exact car names in `TIBBER_CHARGER_VEHICLES`; it does not change
+the separate `TIBBER_VEHICLE_ID` used for Volvo battery sync. Set
+`PHONE_PRESENCE_ENABLED=true` only after the router and phone have been
+commissioned. The independent schedule checks every 15 minutes from 08:00
+through 17:00 Stockholm time. A detected arrival keeps checks running every
+15 minutes after 17:00 until a successful absence observation completes the
+Ragnar selection. Errors are unknown and never trigger a car change. Pending
+departure tracking is saved in `/data/phone-presence.json` so a restart causes
+a fresh check; it never reuses an old phone observation to select a car.
+
+During attended setup, confirm Björn's iPhone on the Deco connected-client
+page and copy its Wi-Fi MAC for this home network into
+`DECO_ENROLLED_PHONE_MAC`. Use the phone's Fixed private Wi-Fi address mode for
+this network when available; a changed address needs re-enrollment. Configure
+the Deco owner password in the private `.env` file with owner-only permissions
+(`chmod 600 .env`). Owner login may invalidate another Deco owner session, so
+plan setup and commissioning accordingly.
+
+The service connects directly to the private router address over HTTPS. It
+requires an attended SHA-256 pin for the router's TLS public key in
+`DECO_TLS_PUBLIC_KEY_SHA256`; obtain and verify that key on a trusted local
+network before enabling the feature. For example, the public-key digest can
+be displayed with:
+
+```bash
+openssl s_client -connect 192.168.68.1:443 </dev/null 2>/dev/null \
+  | openssl x509 -pubkey -noout \
+  | openssl pkey -pubin -outform DER \
+  | sha256sum
+```
+
+Copy the 64 hexadecimal digits into `.env`. Certificate or key replacement
+requires re-verifying and updating this pin. The Deco M5 firmware and Pi
+compatibility must be confirmed during attended commissioning before
+enablement; a protocol reference alone does not prove compatibility.
+
+Run the normal daemon with `--dry-run` to exercise scheduled Deco reads and
+see intended Tibber selection while suppressing presence-related Tibber
+mutations. Set `PHONE_PRESENCE_ENABLED=false` and restart to stop monitoring;
+the currently selected Tibber car remains selected. To roll back, disable the
+feature, then choose the desired car in the Tibber app if needed. The normal
+Volvo battery sync and lock schedule remain independent.
+
 ### Raspberry Pi
 
 - Raspberry Pi OS (Bookworm or later) — arm64.
