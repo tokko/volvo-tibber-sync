@@ -484,6 +484,7 @@ type phonePresenceState struct {
 func buildPhonePresenceConfig(tbrClient *tibber.Client, tbrConf tibberConfig) *phonePresenceConfig {
 	enabledSetting := strings.ToLower(strings.TrimSpace(config.Optional("PHONE_PRESENCE_ENABLED", "false")))
 	if enabledSetting == "false" || enabledSetting == "" {
+		slog.Info("phone presence disabled; set PHONE_PRESENCE_ENABLED=true to enable")
 		return nil
 	}
 	if enabledSetting != "true" {
