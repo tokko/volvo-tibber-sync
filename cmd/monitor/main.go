@@ -152,7 +152,7 @@ func run() error {
 		} else {
 			pushToTibber(pCtx, tbrClient, tbrConf, state)
 		}
-		if tbrConf.chargerID != "" && (presence == nil || *flagOnce) {
+		if tbrConf.chargerID != "" && *flagOnce {
 			reconcileTibberChargerCar(pCtx, tbrClient, tbrConf, tbrConf.preferredVehicleName, *flagDryRun)
 		}
 	}
@@ -589,11 +589,10 @@ func runPhonePresenceSchedule(ctx context.Context, cfg *phonePresenceConfig, dry
 		cycleCtx, cancel = context.WithTimeout(ctx, 90*time.Second)
 		selection := reconcileTibberChargerCar(cycleCtx, cfg.tibberClient, cfg.tibber, target, dryRun)
 		cancel()
-		if !daytime && state.PendingDeparture && !present && (selection == "changed" || selection == "already-correct") {
+		if state.PendingDeparture && !present {
 			state.PendingDeparture = false
 			if err := savePhonePresenceState(cfg.statePath, state); err != nil {
-				state.PendingDeparture = true
-				slog.Error("phone presence pending departure could not be cleared", "path", cfg.statePath, "err", err)
+				slog.Error("phone presence pending departure could not be persisted as cleared; polling stops until restart", "path", cfg.statePath, "err", err)
 			}
 		}
 		nextCheck := nextPhonePresenceCheck(time.Now(), loc, state.PendingDeparture)
