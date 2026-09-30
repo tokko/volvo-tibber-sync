@@ -73,7 +73,6 @@ const listVehiclesQuery = `query ListVehicles {
       vehicles {
         id
         title
-        shortName
       }
     }
   }
