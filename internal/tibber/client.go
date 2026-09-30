@@ -90,7 +90,13 @@ const homeGizmosQuery = `query HomeGizmos($homeId: String!) {
   me {
     home(id: $homeId) {
       id
-      gizmos { id type name }
+      gizmos {
+        ... on EVCharger {
+          id
+          type
+          name
+        }
+      }
     }
   }
 }`
@@ -100,10 +106,10 @@ const chargerQuery = `query Charger($homeId: String!) {
     home(id: $homeId) {
       id
       gizmos {
-        id
-        type
-        name
         ... on EVCharger {
+          id
+          type
+          name
           vehicles { id name isPreferred }
           userSettings { preferredVehicleId }
         }
