@@ -140,6 +140,9 @@ func run() error {
 	home := homes[selectedHome]
 
 	var chargerEnv map[string]string
+	cancel()
+	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	gizmos, err := client.ListHomeGizmos(ctx, home.ID)
 	if err != nil {
 		return fmt.Errorf("list home chargers: %w", err)
@@ -163,6 +166,9 @@ func run() error {
 		}
 		if chargerIndex >= 0 {
 			selectedCharger = chargers[chargerIndex]
+			cancel()
+			ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
 			charger, err := client.GetCharger(ctx, home.ID, selectedCharger.ID)
 			if err != nil {
 				return fmt.Errorf("read charger %q: %w", selectedCharger.Name, err)
