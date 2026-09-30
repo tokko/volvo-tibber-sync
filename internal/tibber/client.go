@@ -91,28 +91,22 @@ const homeGizmosQuery = `query HomeGizmos($homeId: String!) {
     home(id: $homeId) {
       id
       gizmos {
-        ... on EVCharger {
-          id
-          type
-          name
-        }
+        ... on Gizmo { id title type context { key value } }
+        ... on GizmoGroup { gizmos { id title type } }
       }
     }
   }
 }`
 
-const chargerQuery = `query Charger($homeId: String!) {
+const chargerQuery = `query Charger($homeId: String!, $chargerId: String!) {
   me {
     home(id: $homeId) {
       id
-      gizmos {
-        ... on EVCharger {
-          id
-          type
-          name
-          vehicles { id name isPreferred }
-          userSettings { preferredVehicleId }
-        }
+      vehicleCharger(id: $chargerId) {
+        id
+        name
+        vehicles { id name isPreferred }
+        userSettings { key value }
       }
     }
   }
@@ -133,8 +127,13 @@ func (c *Client) ListHomeGizmos(ctx context.Context, homeID string) ([]Gizmo, er
 	var out struct {
 		Me struct {
 			Home *struct {
-				ID     string  `json:"id"`
-				Gizmos []Gizmo `json:"gizmos"`
+				ID     string `json:"id"`
+				Gizmos []struct {
+					ID     string  `json:"id"`
+					Type   string  `json:"type"`
+					Title  string  `json:"title"`
+					Gizmos []Gizmo `json:"gizmos"`
+				} `json:"gizmos"`
 			} `json:"home"`
 		} `json:"me"`
 	}
@@ -144,13 +143,20 @@ func (c *Client) ListHomeGizmos(ctx context.Context, homeID string) ([]Gizmo, er
 	if out.Me.Home == nil || out.Me.Home.ID != homeID {
 		return nil, fmt.Errorf("tibber home %q was not returned", homeID)
 	}
-	return out.Me.Home.Gizmos, nil
+	var gizmos []Gizmo
+	for _, item := range out.Me.Home.Gizmos {
+		if item.ID != "" || item.Type != "" || item.Title != "" {
+			gizmos = append(gizmos, Gizmo{ID: item.ID, Type: item.Type, Name: item.Title})
+		}
+		gizmos = append(gizmos, item.Gizmos...)
+	}
+	return gizmos, nil
 }
 
 type Gizmo struct {
 	ID   string `json:"id"`
 	Type string `json:"type"`
-	Name string `json:"name"`
+	Name string `json:"title"`
 }
 
 // GetCharger reads both preferred-car representations and the charger's cars.
@@ -158,53 +164,69 @@ func (c *Client) GetCharger(ctx context.Context, homeID, chargerID string) (Char
 	var out struct {
 		Me struct {
 			Home *struct {
-				ID     string `json:"id"`
-				Gizmos []struct {
+				ID             string `json:"id"`
+				VehicleCharger *struct {
 					ID           string           `json:"id"`
-					Type         string           `json:"type"`
 					Name         string           `json:"name"`
 					Vehicles     []ChargerVehicle `json:"vehicles"`
-					UserSettings *struct {
-						PreferredVehicleID *string `json:"preferredVehicleId"`
-					} `json:"userSettings"`
-				} `json:"gizmos"`
+					UserSettings []userSetting    `json:"userSettings"`
+				} `json:"vehicleCharger"`
 			} `json:"home"`
 		} `json:"me"`
 	}
-	if err := c.do(ctx, chargerQuery, map[string]any{"homeId": homeID}, &out); err != nil {
+	if err := c.do(ctx, chargerQuery, map[string]any{"homeId": homeID, "chargerId": chargerID}, &out); err != nil {
 		return Charger{}, err
 	}
 	if out.Me.Home == nil || out.Me.Home.ID != homeID {
 		return Charger{}, fmt.Errorf("tibber home %q was not returned", homeID)
 	}
-	var g *struct {
-		ID           string           `json:"id"`
-		Type         string           `json:"type"`
-		Name         string           `json:"name"`
-		Vehicles     []ChargerVehicle `json:"vehicles"`
-		UserSettings *struct {
-			PreferredVehicleID *string `json:"preferredVehicleId"`
-		} `json:"userSettings"`
-	}
-	for i := range out.Me.Home.Gizmos {
-		if out.Me.Home.Gizmos[i].ID == chargerID {
-			g = &out.Me.Home.Gizmos[i]
-			break
-		}
-	}
+	g := out.Me.Home.VehicleCharger
 	if g == nil {
 		return Charger{}, fmt.Errorf("tibber charger %q was not returned for home %q", chargerID, homeID)
 	}
-	if g.UserSettings == nil || g.UserSettings.PreferredVehicleID == nil {
-		return Charger{}, fmt.Errorf("tibber charger %q returned no user settings", chargerID)
+	if g.ID != chargerID {
+		return Charger{}, fmt.Errorf("tibber charger response ID %q does not match configured ID %q", g.ID, chargerID)
+	}
+	preferredVehicleID, err := preferredChargerVehicleID(g.UserSettings)
+	if err != nil {
+		return Charger{}, fmt.Errorf("tibber charger %q: %w", chargerID, err)
 	}
 	return Charger{
 		ID:                 g.ID,
-		Type:               g.Type,
+		Type:               "EV_CHARGER",
 		Name:               g.Name,
 		Vehicles:           g.Vehicles,
-		PreferredVehicleID: *g.UserSettings.PreferredVehicleID,
+		PreferredVehicleID: preferredVehicleID,
 	}, nil
+}
+
+type userSetting struct {
+	Key   string          `json:"key"`
+	Value json.RawMessage `json:"value"`
+}
+
+func preferredChargerVehicleID(settings []userSetting) (string, error) {
+	var preferredVehicleID string
+	matches := 0
+	for _, setting := range settings {
+		if setting.Key != "preferredVehicleId" {
+			continue
+		}
+		matches++
+		if matches > 1 {
+			return "", fmt.Errorf("charger returned duplicate preferredVehicleId settings")
+		}
+		if len(setting.Value) == 0 || string(bytes.TrimSpace(setting.Value)) == "null" {
+			return "", fmt.Errorf("charger returned an empty preferredVehicleId setting")
+		}
+		if err := json.Unmarshal(setting.Value, &preferredVehicleID); err != nil || preferredVehicleID == "" {
+			return "", fmt.Errorf("charger returned an invalid preferredVehicleId setting")
+		}
+	}
+	if matches == 0 {
+		return "", fmt.Errorf("charger returned no preferredVehicleId setting")
+	}
+	return preferredVehicleID, nil
 }
 
 // SetPreferredVehicleID saves the user's charger preference. Applying it to
