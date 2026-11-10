@@ -29,6 +29,21 @@ type Vehicle struct {
 	ShortName string `json:"shortName"`
 }
 
+// ChargerVehicle is a car linked to a home's EV charger.
+type ChargerVehicle struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	IsPreferred *bool  `json:"isPreferred"`
+}
+
+type Charger struct {
+	ID                 string           `json:"id"`
+	Type               string           `json:"type"`
+	Name               string           `json:"name"`
+	Vehicles           []ChargerVehicle `json:"vehicles"`
+	PreferredVehicleID string           `json:"preferredVehicleId"`
+}
+
 // DisplayName returns the most descriptive available name for the vehicle.
 func (v Vehicle) DisplayName() string {
 	if v.ShortName != "" && v.ShortName != v.Title {
@@ -58,7 +73,6 @@ const listVehiclesQuery = `query ListVehicles {
       vehicles {
         id
         title
-        shortName
       }
     }
   }
@@ -71,6 +85,170 @@ const setVehicleSettingsMutation = `mutation SetVehicleSettings($vehicleId: Stri
     }
   }
 }`
+
+const homeGizmosQuery = `query HomeGizmos($homeId: String!) {
+  me {
+    home(id: $homeId) {
+      id
+      gizmos {
+        ... on Gizmo { id title type context { key value } }
+        ... on GizmoGroup { gizmos { id title type } }
+      }
+    }
+  }
+}`
+
+const chargerQuery = `query Charger($homeId: String!, $chargerId: String!) {
+  me {
+    home(id: $homeId) {
+      id
+      vehicleCharger(id: $chargerId) {
+        id
+        name
+        vehicles { id name isPreferred }
+        userSettings { key value }
+      }
+    }
+  }
+}`
+
+const setChargerSettingsMutation = `mutation SetVehicleChargerSettings($chargerId: String!, $homeId: String!, $settings: [SettingsItemInput!]) {
+  me {
+    home(id: $homeId) {
+      setVehicleChargerSettings(id: $chargerId, homeId: $homeId, settings: $settings) {
+        __typename
+      }
+    }
+  }
+}`
+
+// ListHomeGizmos returns the configured home's gizmos for charger resolution.
+func (c *Client) ListHomeGizmos(ctx context.Context, homeID string) ([]Gizmo, error) {
+	var out struct {
+		Me struct {
+			Home *struct {
+				ID     string `json:"id"`
+				Gizmos []struct {
+					ID     string  `json:"id"`
+					Type   string  `json:"type"`
+					Title  string  `json:"title"`
+					Gizmos []Gizmo `json:"gizmos"`
+				} `json:"gizmos"`
+			} `json:"home"`
+		} `json:"me"`
+	}
+	if err := c.do(ctx, homeGizmosQuery, map[string]any{"homeId": homeID}, &out); err != nil {
+		return nil, err
+	}
+	if out.Me.Home == nil || out.Me.Home.ID != homeID {
+		return nil, fmt.Errorf("tibber home %q was not returned", homeID)
+	}
+	var gizmos []Gizmo
+	for _, item := range out.Me.Home.Gizmos {
+		if item.ID != "" || item.Type != "" || item.Title != "" {
+			gizmos = append(gizmos, Gizmo{ID: item.ID, Type: item.Type, Name: item.Title})
+		}
+		gizmos = append(gizmos, item.Gizmos...)
+	}
+	return gizmos, nil
+}
+
+type Gizmo struct {
+	ID   string `json:"id"`
+	Type string `json:"type"`
+	Name string `json:"title"`
+}
+
+// GetCharger reads both preferred-car representations and the charger's cars.
+func (c *Client) GetCharger(ctx context.Context, homeID, chargerID string) (Charger, error) {
+	var out struct {
+		Me struct {
+			Home *struct {
+				ID             string `json:"id"`
+				VehicleCharger *struct {
+					ID           string           `json:"id"`
+					Name         string           `json:"name"`
+					Vehicles     []ChargerVehicle `json:"vehicles"`
+					UserSettings []userSetting    `json:"userSettings"`
+				} `json:"vehicleCharger"`
+			} `json:"home"`
+		} `json:"me"`
+	}
+	if err := c.do(ctx, chargerQuery, map[string]any{"homeId": homeID, "chargerId": chargerID}, &out); err != nil {
+		return Charger{}, err
+	}
+	if out.Me.Home == nil || out.Me.Home.ID != homeID {
+		return Charger{}, fmt.Errorf("tibber home %q was not returned", homeID)
+	}
+	g := out.Me.Home.VehicleCharger
+	if g == nil {
+		return Charger{}, fmt.Errorf("tibber charger %q was not returned for home %q", chargerID, homeID)
+	}
+	if g.ID != chargerID {
+		return Charger{}, fmt.Errorf("tibber charger response ID %q does not match configured ID %q", g.ID, chargerID)
+	}
+	preferredVehicleID, err := preferredChargerVehicleID(g.UserSettings)
+	if err != nil {
+		return Charger{}, fmt.Errorf("tibber charger %q: %w", chargerID, err)
+	}
+	return Charger{
+		ID:                 g.ID,
+		Type:               "EV_CHARGER",
+		Name:               g.Name,
+		Vehicles:           g.Vehicles,
+		PreferredVehicleID: preferredVehicleID,
+	}, nil
+}
+
+type userSetting struct {
+	Key   string          `json:"key"`
+	Value json.RawMessage `json:"value"`
+}
+
+func preferredChargerVehicleID(settings []userSetting) (string, error) {
+	var preferredVehicleID string
+	matches := 0
+	for _, setting := range settings {
+		if setting.Key != "preferredVehicleId" {
+			continue
+		}
+		matches++
+		if matches > 1 {
+			return "", fmt.Errorf("charger returned duplicate preferredVehicleId settings")
+		}
+		if len(setting.Value) == 0 || string(bytes.TrimSpace(setting.Value)) == "null" {
+			return "", fmt.Errorf("charger returned an empty preferredVehicleId setting")
+		}
+		if err := json.Unmarshal(setting.Value, &preferredVehicleID); err != nil || preferredVehicleID == "" {
+			return "", fmt.Errorf("charger returned an invalid preferredVehicleId setting")
+		}
+	}
+	if matches == 0 {
+		return "", fmt.Errorf("charger returned no preferredVehicleId setting")
+	}
+	return preferredVehicleID, nil
+}
+
+// SetPreferredVehicleID saves the user's charger preference. Applying it to
+// the current charger selection is a separate request via SelectPreferredVehicle.
+func (c *Client) SetPreferredVehicleID(ctx context.Context, homeID, chargerID, vehicleID string) error {
+	vars := map[string]any{
+		"chargerId": chargerID,
+		"homeId":    homeID,
+		"settings":  []map[string]any{{"key": "preferredVehicleId", "value": vehicleID}},
+	}
+	return c.do(ctx, setChargerSettingsMutation, vars, nil)
+}
+
+// SelectPreferredVehicle applies the saved preference to the live charger.
+func (c *Client) SelectPreferredVehicle(ctx context.Context, homeID, chargerID, vehicleID string) error {
+	vars := map[string]any{
+		"chargerId": chargerID,
+		"homeId":    homeID,
+		"settings":  []map[string]any{{"key": "selectPreferredVehicle", "value": vehicleID}},
+	}
+	return c.do(ctx, setChargerSettingsMutation, vars, nil)
+}
 
 // ListHomes returns every home ID on the account.
 func (c *Client) ListHomes(ctx context.Context) ([]Home, error) {

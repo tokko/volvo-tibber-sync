@@ -15,9 +15,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,13 +29,14 @@ import (
 	_ "time/tzdata" // embed zoneinfo so LoadLocation works in distroless (no OS tzdata)
 
 	"github.com/tokko/volvo-tibber-sync/internal/config"
+	"github.com/tokko/volvo-tibber-sync/internal/deco"
 	"github.com/tokko/volvo-tibber-sync/internal/tibber"
 	"github.com/tokko/volvo-tibber-sync/internal/volvo"
 )
 
 var (
 	flagOnce    = flag.Bool("once", false, "run one poll cycle and exit (useful for testing or cron)")
-	flagDryRun  = flag.Bool("dry-run", false, "fetch Volvo state and log the intended action, but do not call Tibber or send a lock command")
+	flagDryRun  = flag.Bool("dry-run", false, "fetch state and log intended actions; do not mutate Tibber or send a lock command")
 	flagLockNow = flag.Bool("lock-now", false, "run one lock-check cycle (lock the car if unlocked) and exit; does not poll or push to Tibber")
 )
 
@@ -110,6 +114,7 @@ func run() error {
 	client := volvo.NewClient(ts, apiKey, vin)
 
 	tbrClient, tbrConf := buildTibberClient(tibberStore)
+	presence := buildPhonePresenceConfig(tbrClient, tbrConf)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -127,6 +132,7 @@ func run() error {
 		"once", *flagOnce,
 		"lock_now", *flagLockNow,
 		"dry_run", *flagDryRun,
+		"phone_presence_enabled", presence != nil,
 	)
 
 	pollOnce := func() {
@@ -143,9 +149,12 @@ func run() error {
 		}
 		if *flagDryRun {
 			logDryRunPush(tbrConf, state)
-			return
+		} else {
+			pushToTibber(pCtx, tbrClient, tbrConf, state)
 		}
-		pushToTibber(pCtx, tbrClient, tbrConf, state)
+		if tbrConf.chargerID != "" && *flagOnce {
+			reconcileTibberChargerCar(pCtx, tbrClient, tbrConf, tbrConf.preferredVehicleName, *flagDryRun)
+		}
 	}
 
 	if *flagLockNow {
@@ -158,6 +167,9 @@ func run() error {
 	if *flagOnce {
 		slog.Info("--once: exiting after single poll")
 		return nil
+	}
+	if presence != nil {
+		go runPhonePresenceSchedule(ctx, presence, *flagDryRun)
 	}
 
 	startLockScheduler(ctx, client)
@@ -446,9 +458,222 @@ type latestState struct {
 }
 
 type tibberConfig struct {
-	homeID      string
-	vehicleID   string
-	vehicleName string
+	homeID               string
+	vehicleID            string
+	vehicleName          string
+	chargerName          string
+	chargerID            string
+	preferredVehicleName string
+	chargerVehicles      map[string]string
+}
+
+type phonePresenceConfig struct {
+	client       *deco.Client
+	mac          string
+	tibberClient *tibber.Client
+	tibber       tibberConfig
+	presentName  string
+	absentName   string
+	statePath    string
+}
+
+type phonePresenceState struct {
+	PendingDeparture bool `json:"pending_departure"`
+}
+
+func buildPhonePresenceConfig(tbrClient *tibber.Client, tbrConf tibberConfig) *phonePresenceConfig {
+	enabledSetting := strings.ToLower(strings.TrimSpace(config.Optional("PHONE_PRESENCE_ENABLED", "false")))
+	if enabledSetting == "false" || enabledSetting == "" {
+		slog.Info("phone presence disabled; set PHONE_PRESENCE_ENABLED=true to enable")
+		return nil
+	}
+	if enabledSetting != "true" {
+		slog.Warn("phone presence disabled; PHONE_PRESENCE_ENABLED must be true or false")
+		return nil
+	}
+	if tbrClient == nil {
+		slog.Warn("phone presence disabled; Tibber is not configured")
+		return nil
+	}
+	presentName := config.Optional("PHONE_PRESENCE_CAR_PRESENT", "pappas bil")
+	absentName := config.Optional("PHONE_PRESENCE_CAR_ABSENT", "Ragnar")
+	presentID, presentOK := tbrConf.chargerVehicles[presentName]
+	absentID, absentOK := tbrConf.chargerVehicles[absentName]
+	if tbrConf.chargerID == "" || tbrConf.chargerName == "" || !presentOK || !absentOK || presentName == absentName || presentID == absentID {
+		slog.Warn("phone presence disabled; Tibber charger and two distinct mapped car names are required")
+		return nil
+	}
+	mac, err := net.ParseMAC(config.Optional("DECO_ENROLLED_PHONE_MAC", ""))
+	if err != nil || !validPhoneMAC(mac) {
+		slog.Warn("phone presence disabled; DECO_ENROLLED_PHONE_MAC must be an enrolled unicast MAC address")
+		return nil
+	}
+	decoClient, err := deco.NewClient(
+		config.Optional("DECO_ROUTER_URL", "https://192.168.68.1"),
+		config.Optional("DECO_OWNER_PASSWORD", ""),
+		config.Optional("DECO_TLS_PUBLIC_KEY_SHA256", ""),
+	)
+	if err != nil {
+		slog.Warn("phone presence disabled; invalid Deco configuration", "err", err)
+		return nil
+	}
+	return &phonePresenceConfig{
+		client: decoClient, mac: strings.ToLower(mac.String()),
+		tibberClient: tbrClient, tibber: tbrConf,
+		presentName: presentName, absentName: absentName,
+		statePath: config.Optional("PHONE_PRESENCE_STATE_PATH", "/data/phone-presence.json"),
+	}
+}
+
+func runPhonePresenceSchedule(ctx context.Context, cfg *phonePresenceConfig, dryRun bool) {
+	loc, err := time.LoadLocation("Europe/Stockholm")
+	if err != nil {
+		slog.Error("phone presence schedule disabled; Europe/Stockholm timezone unavailable", "err", err)
+		return
+	}
+	state, err := loadPhonePresenceState(cfg.statePath)
+	if err != nil {
+		slog.Warn("phone presence state could not be read; retaining pending departure until a confirmed absence", "path", cfg.statePath, "err", err)
+		state.PendingDeparture = true
+	}
+	for {
+		next := nextPhonePresenceCheck(time.Now(), loc, state.PendingDeparture)
+		delay := time.Until(next)
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+		cycleCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		clients, pollErr := cfg.client.ConnectedClients(cycleCtx)
+		cancel()
+		observedAt := time.Now().In(loc)
+		if pollErr != nil {
+			nextCheck := nextPhonePresenceCheck(time.Now(), loc, state.PendingDeparture)
+			slog.Warn("phone presence observation unknown", "observed_at", observedAt.Format(time.RFC3339), "next_check", nextCheck.In(loc).Format(time.RFC3339), "err", pollErr)
+			continue
+		}
+		present, matches := false, 0
+		for _, client := range clients {
+			if client.MAC == cfg.mac {
+				matches++
+				present = client.Online
+			}
+		}
+		if matches > 1 {
+			nextCheck := nextPhonePresenceCheck(time.Now(), loc, state.PendingDeparture)
+			slog.Warn("phone presence observation unknown; enrolled MAC matched multiple router records", "observed_at", observedAt.Format(time.RFC3339), "next_check", nextCheck.In(loc).Format(time.RFC3339))
+			continue
+		}
+		daytime := phonePresenceDaytime(next.In(loc))
+		if !daytime && !state.PendingDeparture {
+			continue
+		}
+		target := cfg.absentName
+		stateName := "absent"
+		if present {
+			target = cfg.presentName
+			stateName = "present"
+			if !state.PendingDeparture {
+				state.PendingDeparture = true
+				if err := savePhonePresenceState(cfg.statePath, state); err != nil {
+					slog.Error("phone presence selection skipped; pending departure could not be persisted", "path", cfg.statePath, "err", err)
+					continue
+				}
+			}
+		}
+		cycleCtx, cancel = context.WithTimeout(ctx, 90*time.Second)
+		selection := reconcileTibberChargerCar(cycleCtx, cfg.tibberClient, cfg.tibber, target, dryRun)
+		cancel()
+		if state.PendingDeparture && !present {
+			state.PendingDeparture = false
+			if err := savePhonePresenceState(cfg.statePath, state); err != nil {
+				slog.Error("phone presence pending departure could not be persisted as cleared; polling stops until restart", "path", cfg.statePath, "err", err)
+			}
+		}
+		nextCheck := nextPhonePresenceCheck(time.Now(), loc, state.PendingDeparture)
+		slog.Info("phone presence reconciliation", "observed_at", observedAt.Format(time.RFC3339), "state", stateName, "vehicle", target, "selection", selection, "next_check", nextCheck.In(loc).Format(time.RFC3339), "dry_run", dryRun)
+	}
+}
+
+func validPhoneMAC(mac net.HardwareAddr) bool {
+	if len(mac) != 6 || mac[0]&1 != 0 {
+		return false
+	}
+	for _, octet := range mac {
+		if octet != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func nextPhonePresenceCheck(now time.Time, loc *time.Location, pending bool) time.Time {
+	candidate := now.Truncate(time.Minute)
+	if candidate.Before(now) {
+		candidate = candidate.Add(time.Minute)
+	}
+	for i := 0; i < 48*60; i++ {
+		local := candidate.In(loc)
+		minute := local.Hour()*60 + local.Minute()
+		if local.Minute()%15 == 0 && (pending || (minute >= 8*60 && minute <= 17*60)) {
+			return candidate
+		}
+		candidate = candidate.Add(time.Minute)
+	}
+	return candidate
+}
+
+func phonePresenceDaytime(t time.Time) bool {
+	minute := t.Hour()*60 + t.Minute()
+	return minute >= 8*60 && minute <= 17*60
+}
+
+func loadPhonePresenceState(path string) (phonePresenceState, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return phonePresenceState{}, nil
+		}
+		return phonePresenceState{}, err
+	}
+	var raw struct {
+		PendingDeparture *bool `json:"pending_departure"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&raw); err != nil {
+		return phonePresenceState{}, err
+	}
+	if raw.PendingDeparture == nil {
+		return phonePresenceState{}, errors.New("pending_departure is missing")
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return phonePresenceState{}, errors.New("phone presence state has trailing data")
+		}
+		return phonePresenceState{}, err
+	}
+	return phonePresenceState{PendingDeparture: *raw.PendingDeparture}, nil
+}
+
+func savePhonePresenceState(path string, state phonePresenceState) error {
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(data, '\n'), 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // buildTibberClient returns a configured client or (nil, _) if Tibber is not
@@ -460,6 +685,36 @@ func buildTibberClient(tokenStorePath string) (*tibber.Client, tibberConfig) {
 	homeID := config.Optional("TIBBER_HOME_ID", "")
 	vehicleID := config.Optional("TIBBER_VEHICLE_ID", "")
 	vehicleName := config.Optional("TIBBER_VEHICLE_NAME", "")
+	chargerName := config.Optional("TIBBER_CHARGER_NAME", "")
+	chargerID := config.Optional("TIBBER_CHARGER_ID", "")
+	preferredVehicleName := config.Optional("TIBBER_PREFERRED_VEHICLE_NAME", "")
+	chargerVehicles := map[string]string{}
+	vehicleMapValue := config.Optional("TIBBER_CHARGER_VEHICLES", "")
+	if vehicleMapValue != "" {
+		values, err := url.ParseQuery(vehicleMapValue)
+		if err != nil {
+			slog.Warn("tibber charger vehicle map is malformed; selection is disabled")
+			chargerVehicles = nil
+		} else {
+			for name, ids := range values {
+				if len(ids) != 1 {
+					slog.Warn("tibber charger vehicle map has a duplicate name; selection is disabled", "name", name)
+					chargerVehicles = nil
+					break
+				}
+				chargerVehicles[name] = ids[0]
+			}
+		}
+		seenIDs := make(map[string]bool, len(chargerVehicles))
+		for name, id := range chargerVehicles {
+			if strings.TrimSpace(name) == "" || strings.TrimSpace(id) == "" || seenIDs[id] {
+				slog.Warn("tibber charger vehicle map has a missing or duplicate name/ID; selection is disabled")
+				chargerVehicles = nil
+				break
+			}
+			seenIDs[id] = true
+		}
+	}
 
 	if email == "" && password == "" && homeID == "" && vehicleID == "" {
 		return nil, tibberConfig{}
@@ -468,6 +723,19 @@ func buildTibberClient(tokenStorePath string) (*tibber.Client, tibberConfig) {
 		slog.Warn("tibber partially configured; skipping push — need TIBBER_EMAIL, TIBBER_PASSWORD, TIBBER_HOME_ID, TIBBER_VEHICLE_ID")
 		return nil, tibberConfig{}
 	}
+	if chargerName != "" || chargerID != "" || preferredVehicleName != "" || len(chargerVehicles) > 0 {
+		if chargerName == "" || chargerID == "" || preferredVehicleName == "" || len(chargerVehicles) == 0 {
+			slog.Warn("tibber charger selection is partially configured; selection is disabled")
+			chargerName, chargerID, preferredVehicleName, chargerVehicles = "", "", "", nil
+		} else if _, ok := chargerVehicles[preferredVehicleName]; !ok {
+			slog.Warn("tibber preferred car has no configured name/ID mapping; selection is disabled", "name", preferredVehicleName)
+			chargerName, chargerID, preferredVehicleName, chargerVehicles = "", "", "", nil
+		}
+	}
+	return buildTibberClientWithConfig(tokenStorePath, email, password, homeID, vehicleID, vehicleName, chargerName, chargerID, preferredVehicleName, chargerVehicles)
+}
+
+func buildTibberClientWithConfig(tokenStorePath, email, password, homeID, vehicleID, vehicleName, chargerName, chargerID, preferredVehicleName string, chargerVehicles map[string]string) (*tibber.Client, tibberConfig) {
 
 	sess := tibber.NewSession(email, password)
 	if stored, ok := loadTibberToken(tokenStorePath); ok {
@@ -482,10 +750,193 @@ func buildTibberClient(tokenStorePath string) (*tibber.Client, tibberConfig) {
 	})
 
 	return tibber.NewClient(sess), tibberConfig{
-		homeID:      homeID,
-		vehicleID:   vehicleID,
-		vehicleName: vehicleName,
+		homeID:               homeID,
+		vehicleID:            vehicleID,
+		vehicleName:          vehicleName,
+		chargerName:          chargerName,
+		chargerID:            chargerID,
+		preferredVehicleName: preferredVehicleName,
+		chargerVehicles:      chargerVehicles,
 	}
+}
+
+func reconcileTibberChargerCar(ctx context.Context, c *tibber.Client, cfg tibberConfig, targetName string, dryRun bool) string {
+	targetID, ok := cfg.chargerVehicles[targetName]
+	if !ok || targetName == "" {
+		slog.Error("tibber charger selection skipped; target has no configured name/ID mapping", "vehicle", targetName)
+		return "incomplete"
+	}
+
+	const maxAttempts = 2
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		charger, err := readConfiguredCharger(ctx, c, cfg)
+		if err != nil {
+			slog.Error("tibber charger selection read failed", "err", err, "attempt", attempt)
+			return "incomplete"
+		}
+		target, err := validateTargetVehicle(charger, targetName, targetID)
+		if err != nil {
+			slog.Error("tibber charger selection skipped", "err", err)
+			return "incomplete"
+		}
+		aligned, err := chargerSelectionAligned(charger, target.ID)
+		if err != nil {
+			slog.Error("tibber charger selection skipped", "err", err)
+			return "incomplete"
+		}
+		if aligned {
+			slog.Info("tibber charger car already selected", "charger", cfg.chargerName, "vehicle", targetName, "vehicle_id", targetID)
+			return "already-correct"
+		}
+		if dryRun {
+			slog.Info("tibber charger selection (dry-run — NOT sent)", "charger", cfg.chargerName, "charger_id", cfg.chargerID, "vehicle", targetName, "vehicle_id", targetID, "saved_vehicle_id", charger.PreferredVehicleID)
+			return "dry-run"
+		}
+
+		if charger.PreferredVehicleID != target.ID {
+			if err := c.SetPreferredVehicleID(ctx, cfg.homeID, cfg.chargerID, target.ID); err != nil {
+				slog.Warn("tibber saved charger preference request failed; reading actual state before recovery", "err", err, "attempt", attempt)
+			}
+			charger, err = readConfiguredCharger(ctx, c, cfg)
+			if err != nil {
+				slog.Error("tibber charger selection readback failed", "err", err, "attempt", attempt)
+				return "incomplete"
+			}
+			if _, err := validateTargetVehicle(charger, targetName, targetID); err != nil {
+				slog.Error("tibber charger selection stopped after saved preference request", "err", err)
+				return "incomplete"
+			}
+			if charger.PreferredVehicleID != target.ID {
+				slog.Warn("tibber saved charger preference did not take effect", "wanted_vehicle_id", target.ID, "saved_vehicle_id", charger.PreferredVehicleID, "attempt", attempt)
+				continue
+			}
+		}
+
+		aligned, err = chargerSelectionAligned(charger, target.ID)
+		if err != nil {
+			slog.Error("tibber charger selection skipped", "err", err)
+			return "incomplete"
+		}
+		if !aligned {
+			if err := c.SelectPreferredVehicle(ctx, cfg.homeID, cfg.chargerID, target.ID); err != nil {
+				slog.Warn("tibber current charger selection request failed; reading actual state before recovery", "err", err, "attempt", attempt)
+			}
+		}
+
+		for read := 0; read < 7; read++ {
+			if read > 0 {
+				select {
+				case <-ctx.Done():
+					slog.Warn("tibber charger selection readback timed out", "vehicle", targetName, "attempt", attempt)
+					return "incomplete"
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+			charger, err = readConfiguredCharger(ctx, c, cfg)
+			if err != nil {
+				slog.Error("tibber charger selection readback failed", "err", err, "attempt", attempt)
+				return "incomplete"
+			}
+			if _, err := validateTargetVehicle(charger, targetName, targetID); err != nil {
+				slog.Error("tibber charger selection stopped during readback", "err", err)
+				return "incomplete"
+			}
+			aligned, err = chargerSelectionAligned(charger, target.ID)
+			if err != nil {
+				slog.Error("tibber charger selection skipped", "err", err)
+				return "incomplete"
+			}
+			if aligned {
+				slog.Info("tibber charger car selection confirmed", "charger", cfg.chargerName, "vehicle", targetName, "vehicle_id", targetID)
+				return "changed"
+			}
+		}
+		slog.Warn("tibber charger selection remains mismatched; will reconcile on the next observation", "charger", cfg.chargerName, "vehicle", targetName, "vehicle_id", targetID, "attempt", attempt)
+	}
+	return "incomplete"
+}
+
+func readConfiguredCharger(ctx context.Context, c *tibber.Client, cfg tibberConfig) (tibber.Charger, error) {
+	gizmos, err := c.ListHomeGizmos(ctx, cfg.homeID)
+	if err != nil {
+		return tibber.Charger{}, fmt.Errorf("list configured home gizmos: %w", err)
+	}
+	chargerMatches := 0
+	for _, g := range gizmos {
+		if g.Type == "EV_CHARGER" && (g.ID == cfg.chargerID || g.Name == cfg.chargerName) {
+			chargerMatches++
+			if g.ID != cfg.chargerID || g.Name != cfg.chargerName {
+				return tibber.Charger{}, fmt.Errorf("configured charger name and ID do not match one EV_CHARGER in home %q", cfg.homeID)
+			}
+		}
+	}
+	if chargerMatches != 1 {
+		return tibber.Charger{}, fmt.Errorf("configured charger %q (%s) matched %d EV_CHARGER gizmos in home %q", cfg.chargerName, cfg.chargerID, chargerMatches, cfg.homeID)
+	}
+	charger, err := c.GetCharger(ctx, cfg.homeID, cfg.chargerID)
+	if err != nil {
+		return tibber.Charger{}, fmt.Errorf("read configured charger: %w", err)
+	}
+	if charger.ID != cfg.chargerID || charger.Name != cfg.chargerName || charger.Type != "EV_CHARGER" {
+		return tibber.Charger{}, fmt.Errorf("charger response does not match configured EV_CHARGER %q (%s)", cfg.chargerName, cfg.chargerID)
+	}
+	if err := validateConfiguredChargerVehicles(charger, cfg.chargerVehicles); err != nil {
+		return tibber.Charger{}, err
+	}
+	return charger, nil
+}
+
+func validateTargetVehicle(charger tibber.Charger, name, id string) (tibber.ChargerVehicle, error) {
+	nameMatches, idMatches := 0, 0
+	var target tibber.ChargerVehicle
+	for _, vehicle := range charger.Vehicles {
+		if vehicle.Name == name {
+			nameMatches++
+			target = vehicle
+		}
+		if vehicle.ID == id {
+			idMatches++
+		}
+	}
+	if nameMatches != 1 || idMatches != 1 || target.ID != id {
+		return tibber.ChargerVehicle{}, fmt.Errorf("configured car name and ID do not uniquely match a vehicle on charger %q", charger.Name)
+	}
+	return target, nil
+}
+
+func validateConfiguredChargerVehicles(charger tibber.Charger, configured map[string]string) error {
+	if len(configured) == 0 {
+		return fmt.Errorf("no configured charger car mappings")
+	}
+	seenIDs := make(map[string]bool, len(configured))
+	for name, id := range configured {
+		if strings.TrimSpace(name) == "" || strings.TrimSpace(id) == "" || seenIDs[id] {
+			return fmt.Errorf("configured charger car mappings contain a missing or duplicate name/ID")
+		}
+		seenIDs[id] = true
+		if _, err := validateTargetVehicle(charger, name, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func chargerSelectionAligned(charger tibber.Charger, targetID string) (bool, error) {
+	preferred := 0
+	targetPreferred := false
+	for _, vehicle := range charger.Vehicles {
+		if vehicle.ID == "" || vehicle.Name == "" || vehicle.IsPreferred == nil {
+			return false, fmt.Errorf("charger returned a vehicle with missing ID, name, or preference status")
+		}
+		if *vehicle.IsPreferred {
+			preferred++
+			targetPreferred = vehicle.ID == targetID
+		}
+	}
+	if preferred > 1 {
+		return false, fmt.Errorf("charger returned multiple currently preferred vehicles")
+	}
+	return charger.PreferredVehicleID == targetID && targetPreferred, nil
 }
 
 func pushToTibber(ctx context.Context, c *tibber.Client, cfg tibberConfig, s volvo.ChargeState) {
