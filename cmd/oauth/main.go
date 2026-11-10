@@ -48,14 +48,14 @@ func run() error {
 	_ = config.LoadDotEnv(".env")
 
 	var (
-		clientID    = flag.String("client-id", os.Getenv("VOLVO_CLIENT_ID"), "Volvo OAuth2 client id")
+		clientID     = flag.String("client-id", os.Getenv("VOLVO_CLIENT_ID"), "Volvo OAuth2 client id")
 		clientSecret = flag.String("client-secret", os.Getenv("VOLVO_CLIENT_SECRET"), "Volvo OAuth2 client secret")
-		apiKey      = flag.String("api-key", os.Getenv("VOLVO_API_KEY"), "Volvo VCC API key")
-		vin         = flag.String("vin", os.Getenv("VOLVO_VIN"), "Vehicle VIN")
-		redirectURI = flag.String("redirect-uri", defaultRedirectURI, "OAuth redirect URI registered in the Volvo developer portal")
-		envOut      = flag.String("out", ".env", "path to write the resulting .env file")
-		tokenOut    = flag.String("token-out", "./data/token.json", "path to seed the monitor token store (bind-mounted to /data)")
-		scopesFlag  = flag.String("scopes", strings.Join(volvo.DefaultScopes, " "), "space-separated OAuth scopes")
+		apiKey       = flag.String("api-key", os.Getenv("VOLVO_API_KEY"), "Volvo VCC API key")
+		vin          = flag.String("vin", os.Getenv("VOLVO_VIN"), "Vehicle VIN")
+		redirectURI  = flag.String("redirect-uri", defaultRedirectURI, "OAuth redirect URI registered in the Volvo developer portal")
+		envOut       = flag.String("out", ".env", "path to write the resulting .env file")
+		tokenOut     = flag.String("token-out", "./data/token.json", "path to seed the monitor token store (bind-mounted to /data)")
+		scopesFlag   = flag.String("scopes", strings.Join(volvo.DefaultScopes, " "), "space-separated OAuth scopes")
 	)
 	flag.Parse()
 
@@ -114,6 +114,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if tok.AccessToken == "" || tok.RefreshToken == "" {
+		return errors.New("Volvo did not return both access and refresh tokens")
+	}
 
 	fmt.Printf("Success. Access token expires at %s.\n", tok.ExpiresAt.Format(time.RFC3339))
 	if err := config.UpdateDotEnv(*envOut, map[string]string{
@@ -156,7 +159,8 @@ func writeTokenStore(path string, tok volvo.Token) error {
 }
 
 func buildAuthURL(clientID, redirectURI, scopes, state, challenge string) (string, error) {
-	u, err := url.Parse(volvo.AuthURL)
+	authorizationURL, _ := volvo.OAuthEndpoints(clientID)
+	u, err := url.Parse(authorizationURL)
 	if err != nil {
 		return "", err
 	}

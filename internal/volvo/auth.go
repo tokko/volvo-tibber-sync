@@ -13,9 +13,19 @@ import (
 )
 
 const (
-	AuthURL  = "https://volvoid.eu.volvocars.com/as/authorization.oauth2"
-	TokenURL = "https://volvoid.eu.volvocars.com/as/token.oauth2"
+	legacyAuthURL  = "https://volvoid.eu.volvocars.com/as/authorization.oauth2"
+	legacyTokenURL = "https://volvoid.eu.volvocars.com/as/token.oauth2"
+	keycloakURL    = "https://auth.volvocars.com/realms/volvocars/protocol/openid-connect"
 )
+
+// OAuthEndpoints returns the authorization and token URLs for a portal client.
+// Legacy clients keep working while a replacement client is commissioned.
+func OAuthEndpoints(clientID string) (authorizationURL, tokenURL string) {
+	if strings.HasPrefix(clientID, "vid-") {
+		return keycloakURL + "/auth", keycloakURL + "/token"
+	}
+	return legacyAuthURL, legacyTokenURL
+}
 
 // DefaultScopes for the Energy API v2. The single energy:state:read scope
 // grants access to the unified /energy/v2/vehicles/{vin}/state endpoint.
@@ -114,7 +124,8 @@ func (ts *TokenSource) ExchangeCode(ctx context.Context, code, codeVerifier, red
 }
 
 func (ts *TokenSource) postToken(ctx context.Context, form url.Values) (Token, error) {
-	req, err := http.NewRequestWithContext(ctx, "POST", TokenURL, strings.NewReader(form.Encode()))
+	_, tokenURL := OAuthEndpoints(ts.clientID)
+	req, err := http.NewRequestWithContext(ctx, "POST", tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return Token{}, err
 	}

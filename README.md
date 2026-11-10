@@ -336,6 +336,37 @@ to target Ragnar even when the charger selects another car.
 
 ## Troubleshooting
 
+### Volvo ID migration by 31 January 2027
+
+Follow the [Volvo migration guide](https://developer.volvocars.com/news/volvoid-migration/).
+Publish a replacement application with the same API access. The portal requires a public terms URL. This project uses [its GitHub Pages terms page](https://tokko.github.io/volvo-tibber-sync/terms.html). Obtain the replacement app's
+`vid-` client ID, client secret, and VCC API key. Confirm that the redirect
+URI used by `oauth` is registered for the new client. The default callback is `https://tokko.github.io/volvo-tibber-sync/callback.html`. The helper and monitor
+select Volvo's new OAuth endpoints for `vid-` clients.
+
+Authorize with the updated `oauth` in a private staging directory with its own
+`.env` and `data/token.json`. Enter the replacement credentials and current VIN
+in that directory's `.env`. Use the usual Energy scope and include the
+[lock scopes](#nightly-auto-lock-optional) if nightly auto-lock is enabled.
+Run the updated monitor from that directory with
+`TOKEN_STORE_PATH=./data/token.json ./monitor --once --dry-run` and confirm it
+reads the battery state. With the staging monitor stopped, set `expires_at`
+in the staging token store to a past timestamp and repeat the check. Confirm
+the monitor logs a successful refresh, persists the token, and reads battery
+state again. If auto-lock is enabled, also check lock status with
+`TOKEN_STORE_PATH=./data/token.json ./monitor --lock-now --dry-run`.
+
+On the Pi, stop the monitor before taking an owner-only backup of the binaries,
+`.env`, and Volvo token store. Install the updated binaries and the verified
+token store, and update the Volvo credential and bootstrap token entries in
+the existing `.env`. Preserve the other settings. Run
+`docker compose up -d --force-recreate monitor` so the container picks up the
+new environment. Confirm a fresh Volvo reading and the expected Tibber sync
+in the logs. If cutover fails, stop the monitor, restore the backed-up
+binaries, environment and Volvo token store together, and recreate the
+container. Retire the old application in the portal once the replacement
+has been verified in production. The November 2026 Pi cutover verified a battery reading, token refresh and persistence, a second battery reading, and a production update to Tibber.
+
 **OAuth code rejected** — the code shown on the callback page expires in a
 few minutes. If the exchange fails, re-run `./oauth` and complete the flow
 without delay.
